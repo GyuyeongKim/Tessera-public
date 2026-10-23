@@ -1,0 +1,4 @@
+comment = 'Tessera join-aggregate operator and item similarity'
+default_version = '1.0'
+module_pathname = '$libdir/tessera_pg'
+relocatable = true
