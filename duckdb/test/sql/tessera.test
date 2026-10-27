@@ -1,0 +1,171 @@
+require tessera
+
+statement ok
+SET tessera_min_expansion = 0;
+
+statement ok
+SET tessera_min_expansion_cross = 0;
+
+statement ok
+CREATE TABLE t AS SELECT i % 50 AS k, (i * 7) % 13 AS x, (i % 5) + 1 AS v FROM range(2000) r(i);
+
+query II
+EXPLAIN SELECT a.x, b.x, COUNT(*) FROM t a, t b WHERE a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*TESSERA.*
+
+statement ok
+SET tessera_enabled = false;
+
+query II
+EXPLAIN SELECT a.x, b.x, COUNT(*) FROM t a, t b WHERE a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<!REGEX>:.*TESSERA.*
+
+statement ok
+SET tessera_enabled = true;
+
+statement ok
+CREATE TABLE big (k BIGINT, x BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO big VALUES (1, 1, 134217729), (1, 2, 3), (2, 1, 1), (2, 2, 1);
+
+statement ok
+INSERT INTO big SELECT 3 + i, 3, 1 FROM range(40) r(i);
+
+query III
+SELECT a.x, b.x, SUM(a.v * b.v) FROM big a, big b WHERE a.k = b.k GROUP BY a.x, b.x ORDER BY 1, 2;
+----
+1	1	18014398777917442
+1	2	402653188
+2	1	402653188
+2	2	10
+3	3	40
+
+query III
+SELECT a.x, b.x, SUM(a.v * b.v) FROM big a, big b WHERE a.k = b.k AND a.x < b.x GROUP BY a.x, b.x ORDER BY 1, 2;
+----
+1	2	402653188
+
+statement ok
+CREATE TABLE ov AS SELECT (i % 10)::INTEGER AS k, (i % 7)::INTEGER AS x, 50000::INTEGER AS v FROM range(1000) r(i);
+
+statement error
+SELECT a.x, b.x, SUM(a.v * b.v) FROM ov a, ov b WHERE a.k = b.k GROUP BY a.x, b.x;
+----
+Out of Range Error
+
+statement ok
+CREATE TABLE s AS SELECT (i % 97)::VARCHAR AS k, 'item' || ((i * 31) % 23) AS x, ((i * 7907) % 2001 - 1000) AS v FROM range(3000) r(i);
+
+statement ok
+CREATE TABLE r AS SELECT i % 50 AS k, i % 9 AS x, i * 1000003 - 2500000000 AS v FROM range(3000) r(i);
+
+statement ok
+CREATE TABLE r2 AS SELECT i % 50 AS k, i % 11 AS y, 3000000000 - i * 999983 AS w FROM range(2000) r(i);
+
+statement ok
+CREATE MACRO queries() AS TABLE
+  SELECT 'full' AS q, a.x::VARCHAR AS i, b.x::VARCHAR AS j, COUNT(*)::HUGEINT AS s FROM t a, t b WHERE a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'lt', a.x::VARCHAR, b.x::VARCHAR, COUNT(*) FROM t a, t b WHERE a.k = b.k AND a.x < b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'le', a.x::VARCHAR, b.x::VARCHAR, COUNT(*) FROM t a, t b WHERE a.k = b.k AND a.x <= b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'gt', a.x::VARCHAR, b.x::VARCHAR, COUNT(*) FROM t a, t b WHERE a.k = b.k AND a.x > b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'sum', a.x::VARCHAR, b.x::VARCHAR, SUM(a.v * b.v) FROM t a, t b WHERE a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'str', a.x, b.x, SUM(a.v * b.v) FROM s a, s b WHERE a.k = b.k AND a.x < b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'cross', a.x::VARCHAR, b.y::VARCHAR, SUM(a.v * b.w) FROM r a, r2 b WHERE a.k = b.k GROUP BY a.x, b.y
+  UNION ALL SELECT 'having', a.x, b.x, SUM(a.v * b.v) FROM s a, s b WHERE a.k = b.k AND a.x < b.x GROUP BY a.x, b.x HAVING SUM(a.v * b.v) >= 1000000
+  UNION ALL SELECT 'topk', * FROM (SELECT a.x, b.x, SUM(a.v * b.v) AS s FROM s a, s b WHERE a.k = b.k AND a.x < b.x GROUP BY a.x, b.x ORDER BY s DESC, a.x, b.x LIMIT 10);
+
+statement ok
+CREATE TABLE with_rule AS SELECT * FROM queries();
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE without_rule AS SELECT * FROM queries();
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM with_rule EXCEPT ALL SELECT * FROM without_rule) UNION ALL (SELECT * FROM without_rule EXCEPT ALL SELECT * FROM with_rule));
+----
+0
+
+query I
+SELECT count(DISTINCT q) FROM with_rule;
+----
+9
+
+statement ok
+CREATE TABLE n (k INTEGER, x INTEGER, v DOUBLE);
+
+statement ok
+INSERT INTO n SELECT i % 10, i % 50, 2.0 FROM range(1000) r(i);
+
+statement ok
+INSERT INTO n VALUES (0, 99, 'NaN');
+
+query I
+SELECT count(*) FROM (SELECT a.x, b.x, SUM(a.v * b.v) s FROM n a, n b WHERE a.k = b.k GROUP BY a.x, b.x ORDER BY s DESC LIMIT 11) WHERE isnan(s);
+----
+11
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE t7 AS SELECT i % 1000 AS k, ((i // 1000) % 100)::INTEGER AS x FROM range(100000) r(i);
+
+statement ok
+CREATE TABLE o7 AS SELECT * FROM (VALUES (5), (7)) v(y);
+
+query II
+SELECT count(*), sum(c) FROM (SELECT a.x AS i, b.x AS j, COUNT(*) c FROM t7 a JOIN t7 b ON a.k = b.k GROUP BY a.x, b.x) s JOIN o7 ON s.i = o7.y;
+----
+200	200000
+
+statement ok
+CREATE TABLE ob AS SELECT i AS y FROM range(1000) r(i);
+
+query II
+SELECT count(*), sum(c) FROM (SELECT a.x AS i, b.x AS j, COUNT(*) c FROM t7 a JOIN t7 b ON a.k = b.k GROUP BY a.x, b.x) s JOIN (SELECT y FROM ob WHERE (y * 37) % 1000 = 185) o ON s.i = o.y;
+----
+100	100000
+
+query II
+SELECT count(*), sum(c) FROM (SELECT a.x AS i, b.x AS j, COUNT(*) c FROM t7 a JOIN t7 b ON a.k = b.k GROUP BY a.x, b.x) s JOIN (SELECT y FROM ob WHERE (y * 37) % 1000 = 185) o ON s.j = o.y;
+----
+100	100000
+
+statement ok
+RESET threads;
+
+statement ok
+CREATE TABLE nl AS SELECT i % 10 AS k, CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7 END AS x FROM range(100) r(i);
+
+query II
+EXPLAIN SELECT a.x, b.x, COUNT(*) FROM nl a, nl b WHERE a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<!REGEX>:.*TESSERA.*
+
+statement ok
+CREATE TABLE p AS SELECT i % 10 AS k, i % 7 AS x FROM range(100) r(i);
+
+statement ok
+PREPARE pq AS SELECT a.x, b.x, COUNT(*) FROM p a, p b WHERE a.k = b.k GROUP BY a.x, b.x;
+
+statement ok
+INSERT INTO p VALUES (1, NULL);
+
+statement error
+EXECUTE pq;
+----
+prepare it again
+
+query III
+SELECT x0, x1, round(s, 6) FROM tessera_sim('t', 'k', 'x', 'jaccard', 0.0) ORDER BY 1, 2 LIMIT 1;
+----
+0	1	<REGEX>:0\.[0-9]+
