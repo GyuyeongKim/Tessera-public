@@ -1,0 +1,5 @@
+build/
+*.o
+*.so
+*.jar
+tests/capi_test
