@@ -1,0 +1,10 @@
+build/
+*.o
+*.so
+*.jar
+tests/capi_test
+repro/data/
+repro/results/
+repro/figures/
+repro/tools/
+repro/.venv/
