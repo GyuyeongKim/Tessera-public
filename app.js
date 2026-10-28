@@ -8,9 +8,9 @@ const state = { articles: 2000, query: 'top', pct: 2, busy: true };
 let words = [], stats = {}, duck = null, duckArticles = 0, tess = null, nextId = 1;
 
 function seconds(ms) {
-  if (ms < 1000) return `${(ms / 1000).toFixed(3)} s`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(2)} s`;
-  return `${(ms / 60000).toFixed(1)} min`;
+  if (ms < 1000) return `${(ms / 1000).toFixed(3)}\u00a0s`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(2)}\u00a0s`;
+  return `${(ms / 60000).toFixed(1)}\u00a0min`;
 }
 
 function wordText(i) {
@@ -123,12 +123,12 @@ async function run() {
   stop();
   if (t.type === 'error') lane('tess', '–', t.message, true);
   else lane('tess', seconds(t.ms), 'Done');
-  lane('duck', '0.000 s', 'Running');
+  lane('duck', '0.000\u00a0s', 'Running');
   stop = ticker('duck');
   const d = await runDuck(duck, text);
   stop();
   const oom = d.error && /out of memory/i.test(d.error);
-  if (d.error) lane('duck', seconds(d.ms), oom ? 'Out of memory: a browser page has about 3 GB' : d.error, true);
+  if (d.error) lane('duck', seconds(d.ms), oom ? 'Out of memory: a browser page has about 3\u00a0GB' : d.error, true);
   else lane('duck', seconds(d.ms), 'Done');
 
   const v = $('verdict');
@@ -189,7 +189,7 @@ async function main() {
     tess = new Worker('tessera_worker.js', { type: 'module' });
     const ready = new Promise(res => tess.addEventListener('message', e => { if (e.data.type === 'ready') res(e.data); }, { once: true }));
     tess.postMessage({ type: 'init', bytes: bytes.slice() });
-    $('status').textContent = 'Loading DuckDB-WASM (about 5 MB)…';
+    $('status').textContent = 'Loading DuckDB-WASM (about 5\u00a0MB)…';
     duck = await openDuck();
     $('duckver').textContent = duck.version.replace(/^v/, '') + ' (WASM)';
     $('status').textContent = 'Loading the articles into DuckDB…';
