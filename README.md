@@ -123,11 +123,11 @@ unzip -q sqlite-amalgamation-3540100.zip
 gcc -O2 -DSQLITE_ENABLE_LOAD_EXTENSION -o sqlite3 \
   sqlite-amalgamation-3540100/shell.c sqlite-amalgamation-3540100/sqlite3.c -lpthread -ldl -lm
 SQLITE_SRC=$PWD/sqlite-amalgamation-3540100 ./sqlite/build.sh
-./sqlite3 < examples/sqlite_demo.sql
+./sqlite3 < examples/sqlite.sql
 ```
 
 `make -C tests test` builds the core library, runs its tests, and prints the variant in use (`amx`, `avx512`, `avx2`,
-or `portable` on other CPUs). The demo runs one join-aggregate on 500,000 rows with SQLite's own plan and with Tessera. Both print the
+or `portable` on other CPUs). The example runs one join-aggregate on 500,000 rows with SQLite's own plan and with Tessera. Both print the
 same row count and sum, and the `Run Time` lines show the time of each.
 
 ## Requirements
@@ -195,14 +195,14 @@ do.
 
 ## Engines
 
-| Engine | How Tessera attaches | Demo |
+| Engine | How Tessera attaches | Example |
 |---|---|---|
-| DuckDB | Optimizer rule, `tessera_sim` table function | `examples/duckdb_demo.sql` |
-| PostgreSQL | Planner hook, `tessera_sim` functions | `examples/postgres_demo.sql` |
-| SQLite | Table functions `tessera_xtx`, `tessera_xty`, `tessera_sim` | `examples/sqlite_demo.sql` |
-| Spark | Planner strategy over JNI | `examples/spark_demo.sql` |
+| DuckDB | Optimizer rule, `tessera_sim` table function | `examples/duckdb.sql` |
+| PostgreSQL | Planner hook, `tessera_sim` functions | `examples/postgres.sql` |
+| SQLite | Table functions `tessera_xtx`, `tessera_xty`, `tessera_sim` | `examples/sqlite.sql` |
+| Spark | Planner strategy over JNI | `examples/spark.sql` |
 
-Each demo runs one query with the engine's own plan and with Tessera, and shows that Tessera is in the plan.
+Each example runs one query with the engine's own plan and with Tessera, and shows that Tessera is in the plan.
 
 <details>
 <summary><b>DuckDB</b></summary>
@@ -210,7 +210,7 @@ Each demo runs one query with the engine's own plan and with Tessera, and shows 
 ```sh
 git submodule update --init duckdb extension-ci-tools
 GEN=ninja make release
-build/release/duckdb < examples/duckdb_demo.sql
+build/release/duckdb < examples/duckdb.sql
 ```
 
 The build runs from the repository root, as DuckDB's extension template does. It makes a shell with the extension
@@ -259,13 +259,13 @@ make -j world-bin && make install-world-bin && cd ..
 export PATH=$HOME/pg18/bin:$PATH
 ```
 
-Build the extension, start a server, and run the demo:
+Build the extension, start a server, and run the example:
 
 ```sh
 make -C postgres && make -C postgres install
 initdb -D $HOME/pgdata
 pg_ctl -D $HOME/pgdata -l $HOME/pgdata.log start
-psql -d postgres -f examples/postgres_demo.sql
+psql -d postgres -f examples/postgres.sql
 ```
 
 The Makefile uses the `pg_config` on `PATH` or `PG_CONFIG=/path/to/pg_config`. Load the module with
@@ -319,7 +319,7 @@ export JAVA_HOME=/path/to/jdk-21          # e.g. from adoptium.net or the openjd
 ./spark/build.sh
 $SPARK_HOME/bin/spark-sql --driver-memory 8g --jars spark/tessera-spark.jar \
   --conf spark.sql.extensions=tessera.spark.TesseraExtensions \
-  -f examples/spark_demo.sql
+  -f examples/spark.sql
 ```
 
 `spark/build.sh` writes `spark/tessera-spark.jar`, which carries the JNI library for the platform it was built on
@@ -458,7 +458,7 @@ Its README lists the steps, the variables, and the time and disk that a run take
 | `core/` | The operator as a static or shared library with a C interface (`tessera_c.h`) |
 | `duckdb_ext/`, `postgres/`, `sqlite/`, `spark/` | The engine adapters (the DuckDB extension builds from the root `Makefile` and `extension_config.cmake`) |
 | `duckdb/`, `extension-ci-tools/` | DuckDB and its extension build tools, as pinned submodules |
-| `examples/` | A demo script for each engine |
+| `examples/` | An example script for each engine |
 | `tests/` | Correctness tests for the library and the four adapters |
 | `tools/` | The calibration of the cost model (`calibrate.py` and its driver `calibrate_run.c`) |
 | `packaging/` | The PyPI wheel, the PGXN distribution, and the Maven artifacts, which `.github/workflows/release.yml` builds |
