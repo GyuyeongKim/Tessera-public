@@ -30,6 +30,10 @@ sparse part of the product on a sparse path, and runs only the dense core on the
 
 <p align="center"><img src="assets/three_ways.svg" width="860" alt="Animation of one join-aggregate run three ways: the engine's own plan makes 20.1 billion joined rows and finishes in 8.6 minutes, SPALM multiplies the sparse matrix in 54.3 seconds, and Tessera finishes in 2.9 seconds"></p>
 
+**[Try it in your browser](https://gyuyeongkim.github.io/Tessera-public/).** DuckDB-WASM and Tessera, compiled to
+WebAssembly, run the same SQL on 10,000 New York Times articles on one thread of your browser and return the same
+answer.
+
 ## Key features
 
 | Feature | How it works |
