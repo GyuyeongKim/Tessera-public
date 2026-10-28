@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tessera in Your Browser</title>
+<meta name="description" content="DuckDB and Tessera run the same join-aggregate SQL on New York Times articles, in your browser.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 fill=%22%23c9493c%22/%3E%3Crect x=%222%22 y=%222%22 width=%225%22 height=%225%22 fill=%22%23f4f1ea%22/%3E%3C/svg%3E">
+<script>
+try { const t = localStorage.getItem('theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+</head>
+<body>
+<main>
+  <header class="top">
+    <div>
+      <p class="kicker">Tessera &middot; join-aggregates on skewed sparse relations</p>
+      <h1>Tessera in your browser</h1>
+    </div>
+    <button id="theme" class="link" type="button" aria-label="Switch color theme">Dark</button>
+  </header>
+
+  <p class="lede">A join-aggregate counts, for every pair of values, the rows they share. Here the rows are the words of
+  New York Times articles, and the query asks which words appear together. DuckDB and Tessera run the same SQL on the
+  same rows, each on one thread of your browser, and return the same answer.</p>
+
+  <section class="controls" aria-label="Query">
+    <div class="row">
+      <span class="label">Articles</span>
+      <div class="seg" id="sizes" role="radiogroup" aria-label="Number of articles"></div>
+      <span class="note" id="sizeinfo"></span>
+    </div>
+    <div class="row queries" role="radiogroup" aria-label="Query">
+      <label><input type="radio" name="q" value="top" checked> The 10 pairs that appear together most often</label>
+      <label><input type="radio" name="q" value="having"> Pairs that appear together in at least
+        <select id="pct" aria-label="Share of articles"><option value="1">1%</option><option value="2" selected>2%</option><option value="5">5%</option></select>
+        of the articles</label>
+      <label><input type="radio" name="q" value="all"> All pairs</label>
+    </div>
+    <pre class="sql" id="sql" aria-label="SQL"></pre>
+    <div class="row">
+      <button id="run" class="run" type="button" disabled>Run both</button>
+      <span class="note" id="status">Loading the data and DuckDB-WASM&hellip;</span>
+    </div>
+  </section>
+
+  <section class="race" aria-live="polite">
+    <div class="lane duck">
+      <h2>DuckDB <span class="ver" id="duckver"></span></h2>
+      <p class="how">Its own plan: a hash join that builds a row for every two words in an article, then a hash aggregation.</p>
+      <p class="time" id="ducktime">&ndash;</p>
+      <p class="state" id="duckstate">Waiting</p>
+    </div>
+    <div class="lane tess">
+      <h2>Tessera <span class="ver" id="tessver"></span></h2>
+      <p class="how">A sparse product that adds each article's pairs into counters and drops, before counting, the words that cannot qualify.</p>
+      <p class="time" id="tesstime">&ndash;</p>
+      <p class="state" id="tessstate">Waiting</p>
+    </div>
+  </section>
+
+  <p class="verdict" id="verdict"></p>
+
+  <section class="result" id="result" hidden>
+    <p class="summary" id="summary"></p>
+    <table>
+      <thead><tr><th scope="col">#</th><th scope="col">Word pair</th><th scope="col" class="num">Articles</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+
+  <section class="why">
+    <h2>Where the time goes</h2>
+    <p>DuckDB's join emits a row for every two words that share an article, <span id="joinedrows">millions of</span>
+    rows here, and its aggregation updates a hash table for each of them. Tessera never builds these rows. It adds the
+    pairs of each article into an array of counters and writes only the pairs that occur.</p>
+    <p>With a top 10 or a threshold, the engine can filter only after it has counted every pair. Tessera first bounds how
+    often each word can appear in a pair and drops the words that cannot qualify, so a stricter query runs faster.</p>
+    <p>In this page both engines use one thread and no matrix accelerator. On a server, Tessera also uses every core and
+    runs the most frequent words on the CPU's matrix accelerator, such as Intel AMX.</p>
+  </section>
+
+  <section class="server">
+    <h2>On a server, all 300,000 articles</h2>
+    <table>
+      <thead><tr><th scope="col">Query</th><th scope="col" class="num">DuckDB v1.3.2</th><th scope="col" class="num">Tessera</th><th scope="col" class="num">Gain</th></tr></thead>
+      <tbody>
+        <tr><td>All pairs</td><td class="num">8.6 min</td><td class="num">2.9 s</td><td class="num">178&times;</td></tr>
+        <tr><td>The 1,000 most frequent pairs</td><td class="num">3.8 min</td><td class="num">0.89 s</td><td class="num">255&times;</td></tr>
+      </tbody>
+    </table>
+    <p class="note">Measured on 16 cores of an Intel Xeon Silver 4514Y with AMX, inside DuckDB v1.3.2. SPALM, an
+    in-database linear algebra system, takes 54.3 s for all pairs.</p>
+  </section>
+
+  <footer>
+    <p>Data: the NYTimes collection of <a href="https://archive.ics.uci.edu/dataset/164/bag+of+words">Bag of Words</a>,
+    UCI Machine Learning Repository, D. Newman (CC BY 4.0), 10,000 of its 300,000 articles chosen at random. Words are
+    stored as numbers and shown as text. DuckDB-WASM <span id="duckwasm">1.32.0</span> loads from jsDelivr, and Tessera
+    <span id="tessfoot">1.2.1</span> is compiled with Emscripten for one thread. Queries run in this page and send nothing
+    anywhere.</p>
+    <p><a href="https://github.com/GyuyeongKim/Tessera-public">Tessera on GitHub</a></p>
+  </footer>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>
