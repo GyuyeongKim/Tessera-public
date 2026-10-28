@@ -83,9 +83,10 @@ linear algebra (54.3 s against 2.9 s on the news articles). Release 1.1.1 reruns
 | SQLite in Python | [`sqlite-tessera`](https://pypi.org/project/sqlite-tessera/) on PyPI | `pip install sqlite-tessera` |
 | SQLite | `tessera-sqlite-<version>-<platform>.tar.gz` on the [releases page](https://github.com/GyuyeongKim/Tessera-public/releases) | `.load ./tessera` in the shell |
 | Spark | `io.github.gyuyeongkim:tessera-spark_2.13` on Maven Central | `--packages io.github.gyuyeongkim:tessera-spark_2.13:1.2.1` |
-| DuckDB, PostgreSQL | Source | [Engines](#engines) |
+| PostgreSQL | [`tessera_pg`](https://pgxn.org/dist/tessera_pg/) on PGXN | `pgxn install tessera_pg` |
+| DuckDB | Source | [Engines](#engines) |
 
-The packages are built for Linux on x86-64 and macOS on Apple silicon. In Python:
+The binary packages are built for Linux on x86-64 and macOS on Apple silicon. In Python:
 
 ```python
 import sqlite3
@@ -100,6 +101,10 @@ print(db.execute("SELECT x0, x1, s FROM tessera_xtx('t', 'k', 'x') LIMIT 5").fet
 
 With Spark, add `--conf spark.sql.extensions=tessera.spark.TesseraExtensions` to `spark-sql`, `spark-shell`, or
 `spark-submit`. The jar carries the JNI library for both platforms and runs on Java 17 or later.
+
+The PGXN client (`pip install pgxnclient`) builds `tessera_pg` with the `pg_config` on `PATH` and needs PostgreSQL 18
+with its server headers and GCC with OpenMP. Then load it with `LOAD 'tessera_pg';` and run `CREATE EXTENSION tessera_pg;`
+([PostgreSQL](#engines)).
 
 ## Quick start
 
