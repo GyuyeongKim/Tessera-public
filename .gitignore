@@ -1,0 +1,8 @@
+build/
+*.o
+*.so
+*.jar
+tests/capi_test
+*.dylib
+*.whl
+dist/

@@ -1,0 +1,7 @@
+TESSERA_3 {
+  global:
+    tessera_c_*;
+    tessera_dict_*;
+  local:
+    *;
+};

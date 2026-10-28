@@ -1,0 +1,41 @@
+{
+  "name": "tessera_pg",
+  "abstract": "Fast join-aggregates over skewed sparse relations inside PostgreSQL",
+  "description": "A planner hook that runs join-aggregates such as SELECT a.x, b.x, COUNT(*) FROM r a JOIN r b ON a.k = b.k GROUP BY a.x, b.x, with weights, HAVING, and two relations, as a sparse matrix product with exact results, plus functions for item similarity.",
+  "version": "1.2.1",
+  "maintainer": ["Gyuyeong Kim <skycrawlers2@gmail.com>"],
+  "license": "apache_2_0",
+  "provides": {
+    "tessera_pg": {
+      "abstract": "Join-aggregate operator and item similarity",
+      "file": "tessera_pg--1.0.sql",
+      "docfile": "README.md",
+      "version": "1.0.0"
+    }
+  },
+  "prereqs": {
+    "runtime": {
+      "requires": {
+        "PostgreSQL": "18.0.0"
+      }
+    }
+  },
+  "resources": {
+    "homepage": "https://github.com/GyuyeongKim/Tessera-public",
+    "bugtracker": {
+      "web": "https://github.com/GyuyeongKim/Tessera-public/issues"
+    },
+    "repository": {
+      "url": "https://github.com/GyuyeongKim/Tessera-public.git",
+      "web": "https://github.com/GyuyeongKim/Tessera-public",
+      "type": "git"
+    }
+  },
+  "tags": ["join", "aggregate", "matrix multiplication", "similarity", "co-occurrence"],
+  "release_status": "stable",
+  "generated_by": "Gyuyeong Kim",
+  "meta-spec": {
+    "version": "1.0.0",
+    "url": "https://pgxn.org/meta/spec.txt"
+  }
+}

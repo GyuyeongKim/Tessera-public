@@ -1,0 +1,139 @@
+SET client_min_messages = warning;
+LOAD 'tessera_pg';
+CREATE EXTENSION IF NOT EXISTS tessera_pg;
+SET tessera.threads = 4;
+SET tessera.min_expansion = 0;
+SET tessera.min_expansion_cross = 0;
+CREATE FUNCTION uses_tessera(q text) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE l text;
+BEGIN
+  FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF l LIKE '%Custom Scan (Tessera)%' THEN RETURN true; END IF;
+  END LOOP;
+  RETURN false;
+END $$;
+CREATE TABLE t (k int4 NOT NULL, x int4 NOT NULL, v int4 NOT NULL);
+INSERT INTO t SELECT i % 50, (i * 7) % 13, i % 5 + 1 FROM generate_series(0, 1999) i;
+ANALYZE t;
+SELECT uses_tessera('SELECT a.x, b.x, count(*) FROM t a JOIN t b ON a.k = b.k GROUP BY a.x, b.x');
+ uses_tessera 
+--------------
+ t
+(1 row)
+
+SET tessera.enabled = off;
+SELECT uses_tessera('SELECT a.x, b.x, count(*) FROM t a JOIN t b ON a.k = b.k GROUP BY a.x, b.x');
+ uses_tessera 
+--------------
+ f
+(1 row)
+
+SET tessera.enabled = on;
+CREATE TABLE big (k int8 NOT NULL, x int8 NOT NULL, v int8 NOT NULL);
+INSERT INTO big VALUES (1, 1, 134217729), (1, 2, 3), (2, 1, 1), (2, 2, 1);
+INSERT INTO big SELECT 3 + i, 3, 1 FROM generate_series(0, 39) i;
+SELECT a.x, b.x, sum(a.v * b.v) FROM big a JOIN big b ON a.k = b.k GROUP BY a.x, b.x ORDER BY 1, 2;
+ x | x |        sum        
+---+---+-------------------
+ 1 | 1 | 18014398777917442
+ 1 | 2 |         402653188
+ 2 | 1 |         402653188
+ 2 | 2 |                10
+ 3 | 3 |                40
+(5 rows)
+
+SELECT a.x, b.x, sum(a.v * b.v) FROM big a JOIN big b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x ORDER BY 1, 2;
+ x | x |    sum    
+---+---+-----------
+ 1 | 2 | 402653188
+(1 row)
+
+CREATE TABLE ov (k int4 NOT NULL, x int4 NOT NULL, v int4 NOT NULL);
+INSERT INTO ov SELECT i % 10, i % 7, 50000 FROM generate_series(0, 999) i;
+SELECT a.x, b.x, sum(a.v * b.v) FROM ov a JOIN ov b ON a.k = b.k GROUP BY a.x, b.x;
+ERROR:  integer out of range
+CREATE TABLE s (k text NOT NULL, x text COLLATE "C" NOT NULL, v int8 NOT NULL);
+INSERT INTO s SELECT (i % 97)::text, 'item' || ((i * 31) % 23), (i * 7907) % 2001 - 1000 FROM generate_series(0, 2999) i;
+CREATE TABLE r (k int8 NOT NULL, x int8 NOT NULL, v int8 NOT NULL);
+INSERT INTO r SELECT i % 50, i % 9, i::int8 * 1000003 - 2500000000 FROM generate_series(0, 2999) i;
+CREATE TABLE r2 (k int8 NOT NULL, y int8 NOT NULL, w int8 NOT NULL);
+INSERT INTO r2 SELECT i % 50, i % 11, 3000000000 - i::int8 * 999983 FROM generate_series(0, 1999) i;
+ANALYZE s; ANALYZE r; ANALYZE r2;
+CREATE FUNCTION queries() RETURNS TABLE (q text, i text, j text, s numeric) LANGUAGE sql AS $$
+  SELECT 'full', a.x::text, b.x::text, count(*)::numeric FROM t a JOIN t b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'lt', a.x::text, b.x::text, count(*) FROM t a JOIN t b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'le', a.x::text, b.x::text, count(*) FROM t a JOIN t b ON a.k = b.k AND a.x <= b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'gt', a.x::text, b.x::text, count(*) FROM t a JOIN t b ON a.k = b.k AND a.x > b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'sum', a.x::text, b.x::text, sum(a.v * b.v) FROM t a JOIN t b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'str', a.x, b.x, sum(a.v * b.v) FROM s a JOIN s b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'cross', a.x::text, b.y::text, sum(a.v * b.w) FROM r a JOIN r2 b ON a.k = b.k GROUP BY a.x, b.y
+  UNION ALL SELECT 'having', a.x, b.x, sum(a.v * b.v) FROM s a JOIN s b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x
+    HAVING sum(a.v * b.v) >= 1000000
+$$;
+CREATE TABLE with_hook AS SELECT * FROM queries();
+SET tessera.enabled = off;
+CREATE TABLE without_hook AS SELECT * FROM queries();
+SET tessera.enabled = on;
+SELECT count(*) AS differing_rows FROM ((SELECT * FROM with_hook EXCEPT ALL SELECT * FROM without_hook)
+  UNION ALL (SELECT * FROM without_hook EXCEPT ALL SELECT * FROM with_hook)) d;
+ differing_rows 
+----------------
+              0
+(1 row)
+
+SELECT q, count(*) FROM with_hook GROUP BY q ORDER BY q;
+   q    | count 
+--------+-------
+ cross  |    99
+ full   |   169
+ gt     |    78
+ having |   104
+ le     |    91
+ lt     |    78
+ str    |   253
+ sum    |   169
+(8 rows)
+
+CREATE TABLE nv (k int4 NOT NULL, x int4, v int4 NOT NULL);
+INSERT INTO nv SELECT i % 10, CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7 END, 3 FROM generate_series(0, 299) i;
+ALTER TABLE nv ADD CONSTRAINT nv_x_nn NOT NULL x NOT VALID;
+SELECT uses_tessera('SELECT a.x, b.x, sum(a.v * b.v) FROM nv a JOIN nv b ON a.k = b.k GROUP BY a.x, b.x');
+ uses_tessera 
+--------------
+ f
+(1 row)
+
+CREATE SCHEMA u;
+CREATE FUNCTION u.mul(int4, int4) RETURNS int4 AS 'SELECT $1 + $2' LANGUAGE sql IMMUTABLE;
+CREATE OPERATOR u.* (LEFTARG = int4, RIGHTARG = int4, FUNCTION = u.mul);
+SET search_path = u, pg_catalog, public;
+SELECT public.uses_tessera('SELECT a.x, b.x, sum(a.v * b.v) FROM t a JOIN t b ON a.k = b.k GROUP BY a.x, b.x');
+ uses_tessera 
+--------------
+ f
+(1 row)
+
+RESET search_path;
+SELECT uses_tessera('SELECT a.x, b.x, sum(a.v * b.v) FROM t a JOIN t b ON a.k = b.k GROUP BY a.x, b.x');
+ uses_tessera 
+--------------
+ t
+(1 row)
+
+SELECT x0, x1, round(s::numeric, 6) FROM tessera_sim('t', 'k', 'x', 'jaccard', 0.0) ORDER BY 1, 2 LIMIT 3;
+ x0 | x1 |  round   
+----+----+----------
+  0 |  1 | 0.983402
+  0 |  2 | 0.983402
+  0 |  3 | 0.983402
+(3 rows)
+
+SELECT count(*) FROM tessera_sim('t', 'k', 'x', 'cosine', 0.5, mode => 'full');
+ count 
+-------
+   169
+(1 row)
+
+DROP SCHEMA u CASCADE;
+DROP TABLE t, big, ov, s, r, r2, with_hook, without_hook, nv;
+DROP FUNCTION queries(), uses_tessera(text);

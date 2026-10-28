@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>io.github.gyuyeongkim</groupId>
+  <artifactId>tessera-spark_2.13</artifactId>
+  <version>@VERSION@</version>
+  <packaging>jar</packaging>
+  <name>Tessera for Spark</name>
+  <description>Fast join-aggregates over skewed sparse relations as a Spark SQL extension</description>
+  <url>https://github.com/GyuyeongKim/Tessera-public</url>
+  <licenses>
+    <license>
+      <name>Apache-2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+  <developers>
+    <developer>
+      <id>GyuyeongKim</id>
+      <name>Gyuyeong Kim</name>
+      <email>skycrawlers2@gmail.com</email>
+      <url>https://github.com/GyuyeongKim</url>
+    </developer>
+  </developers>
+  <scm>
+    <connection>scm:git:https://github.com/GyuyeongKim/Tessera-public.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/GyuyeongKim/Tessera-public.git</developerConnection>
+    <url>https://github.com/GyuyeongKim/Tessera-public</url>
+    <tag>v@VERSION@</tag>
+  </scm>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_2.13</artifactId>
+      <version>4.2.0</version>
+      <scope>provided</scope>
+    </dependency>
+  </dependencies>
+</project>
