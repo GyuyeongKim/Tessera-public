@@ -1,6 +1,6 @@
 import { decode } from './dataset.js?v=afa3a41209';
 import { openDuck, loadBase, useArticles, runDuck } from './duck_run.js?v=5cd050b38b';
-import { dict } from './i18n.js?v=3f69ff0d17';
+import { dict } from './i18n.js?v=f96bd1c971';
 
 const SIZES = [1000, 2000, 5000, 10000];
 const fmt = new Intl.NumberFormat('en-US');
