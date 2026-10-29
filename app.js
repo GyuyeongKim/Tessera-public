@@ -194,9 +194,9 @@ function applyLang() {
 
 function setLang(next) {
   lang = next;
-  try { localStorage.setItem('lang', lang); } catch (e) {}
   const url = new URL(location.href);
-  if (url.searchParams.has('lang')) { url.searchParams.set('lang', lang); history.replaceState(null, '', url); }
+  url.searchParams.set('lang', lang);
+  history.replaceState(null, '', url);
   applyLang();
 }
 
