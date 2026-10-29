@@ -5,42 +5,51 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tessera in Your Browser</title>
 <meta name="description" content="DuckDB and Tessera run the same join-aggregate SQL on New York Times articles, in your browser.">
-<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="app.css?v=4a24fad492">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 fill=%22%230062cc%22/%3E%3Crect x=%222%22 y=%222%22 width=%225%22 height=%225%22 fill=%22%23ffffff%22/%3E%3C/svg%3E">
 <script>
 try { const t = localStorage.getItem('theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+(() => {
+  let l = new URLSearchParams(location.search).get('lang');
+  if (l !== 'en' && l !== 'ko') { l = null; try { l = localStorage.getItem('lang'); } catch (e) {} }
+  if (l === 'ko') document.documentElement.lang = 'ko';
+})();
 </script>
 </head>
 <body>
 <main>
   <header class="top">
     <div>
-      <p class="kicker">Tessera &middot; join-aggregates on skewed sparse relations</p>
-      <h1>Tessera in your browser</h1>
+      <p class="kicker" data-i18n="kicker">Tessera &middot; join-aggregates on skewed sparse relations</p>
+      <h1 data-i18n="h1">Tessera in your browser</h1>
     </div>
-    <button id="theme" class="link" type="button" aria-label="Switch color theme">Dark</button>
+    <nav class="tools">
+      <a class="link ico-link" href="https://github.com/GyuyeongKim/Tessera-public"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+      <button id="lang" class="link" type="button" lang="ko" aria-label="Switch the language">한국어</button>
+      <button id="theme" class="link" type="button" data-i18n-aria="aria.theme" aria-label="Switch color theme">Dark</button>
+    </nav>
   </header>
 
-  <p class="lede">A join-aggregate counts, for every pair of values, the rows they share. Here the rows are the words of
+  <p class="lede" data-i18n="lede">A join-aggregate counts, for every pair of values, the rows they share. Here the rows are the words of
   New York Times articles, and the query asks which words appear together. DuckDB and Tessera run the same SQL on the
   same rows, each on one thread of your browser, and return the same answer.</p>
 
-  <section class="controls" aria-label="Query">
+  <section class="controls" data-i18n-aria="aria.query" aria-label="Query">
     <div class="row">
-      <span class="label">Articles</span>
-      <div class="seg" id="sizes" role="radiogroup" aria-label="Number of articles"></div>
+      <span class="label" data-i18n="label.articles">Articles</span>
+      <div class="seg" id="sizes" role="radiogroup" data-i18n-aria="aria.articles" aria-label="Number of articles"></div>
       <span class="note" id="sizeinfo"></span>
     </div>
-    <div class="row queries" role="radiogroup" aria-label="Query">
-      <label><input type="radio" name="q" value="top" checked> The 10 pairs that appear together most often</label>
-      <label><input type="radio" name="q" value="having"> Pairs that appear together in at least
-        <select id="pct" aria-label="Share of articles"><option value="1">1%</option><option value="2" selected>2%</option><option value="5">5%</option></select>
-        of the articles</label>
-      <label><input type="radio" name="q" value="all"> All pairs</label>
+    <div class="row queries" role="radiogroup" data-i18n-aria="aria.query" aria-label="Query">
+      <label><input type="radio" name="q" value="top" checked> <span data-i18n="q.top">The 10 pairs that appear together most often</span></label>
+      <label><input type="radio" name="q" value="having"> <span data-i18n="q.having1">Pairs that appear together in at least</span>
+        <select id="pct" data-i18n-aria="aria.pct" aria-label="Share of articles"><option value="1">1%</option><option value="2" selected>2%</option><option value="5">5%</option></select>
+        <span data-i18n="q.having2">of the articles</span></label>
+      <label><input type="radio" name="q" value="all"> <span data-i18n="q.all">All pairs</span></label>
     </div>
     <pre class="sql" id="sql" aria-label="SQL"></pre>
     <div class="row">
-      <button id="run" class="run" type="button" disabled>Run both</button>
+      <button id="run" class="run" type="button" data-i18n="run" disabled>Run both</button>
       <span class="note" id="status">Loading the data and DuckDB-WASM&hellip;</span>
     </div>
   </section>
@@ -48,13 +57,13 @@ try { const t = localStorage.getItem('theme'); if (t) document.documentElement.d
   <section class="race" aria-live="polite">
     <div class="lane duck">
       <h2>DuckDB <span class="ver" id="duckver"></span></h2>
-      <p class="how">Its own plan: a hash join that builds a row for every two words in an article, then a hash aggregation.</p>
+      <p class="how" data-i18n="duck.how">Its own plan: a hash join that builds a row for every two words in an article, then a hash aggregation.</p>
       <p class="time" id="ducktime">&ndash;</p>
       <p class="state" id="duckstate">Waiting</p>
     </div>
     <div class="lane tess">
       <h2>Tessera <span class="ver" id="tessver"></span></h2>
-      <p class="how">A sparse product that adds each article's pairs into counters and drops, before counting, the words that cannot qualify.</p>
+      <p class="how" data-i18n="tess.how">A sparse product that adds each article's pairs into counters and drops, before counting, the words that cannot qualify.</p>
       <p class="time" id="tesstime">&ndash;</p>
       <p class="state" id="tessstate">Waiting</p>
     </div>
@@ -65,43 +74,43 @@ try { const t = localStorage.getItem('theme'); if (t) document.documentElement.d
   <section class="result" id="result" hidden>
     <p class="summary" id="summary"></p>
     <table>
-      <thead><tr><th scope="col">#</th><th scope="col">Word pair</th><th scope="col" class="num">Articles</th></tr></thead>
+      <thead><tr><th scope="col">#</th><th scope="col" data-i18n="th.pair">Word pair</th><th scope="col" class="num" data-i18n="th.articles">Articles</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
   </section>
 
   <section class="why">
-    <h2>Where the time goes</h2>
-    <p>DuckDB's join emits a row for every two words that share an article, <span id="joinedrows">millions of</span>
+    <h2 data-i18n="why.h">Where the time goes</h2>
+    <p data-i18n-html="why.1">DuckDB's join emits a row for every two words that share an article, <span id="joinedrows">millions of</span>
     rows here, and its aggregation updates a hash table for each of them. Tessera never builds these rows. It adds the
     pairs of each article into an array of counters and writes only the pairs that occur.</p>
-    <p>With a top 10 or a threshold, the engine can filter only after it has counted every pair. Tessera first bounds how
+    <p data-i18n="why.2">With a top 10 or a threshold, the engine can filter only after it has counted every pair. Tessera first bounds how
     often each word can appear in a pair and drops the words that cannot qualify, so a stricter query runs faster.</p>
-    <p>In this page both engines use one thread and no matrix accelerator. On a server, Tessera also uses every core and
+    <p data-i18n="why.3">In this page both engines use one thread and no matrix accelerator. On a server, Tessera also uses every core and
     runs the most frequent words on the CPU's matrix accelerator, such as Intel AMX.</p>
   </section>
 
   <section class="server">
-    <h2>On a server, all 300,000 articles</h2>
+    <h2 data-i18n="server.h">On a server, all 300,000 articles</h2>
     <table>
-      <thead><tr><th scope="col">Query</th><th scope="col" class="num">DuckDB v1.3.2</th><th scope="col" class="num">Tessera</th><th scope="col" class="num">Gain</th></tr></thead>
+      <thead><tr><th scope="col" data-i18n="th.query">Query</th><th scope="col" class="num">DuckDB v1.3.2</th><th scope="col" class="num">Tessera</th><th scope="col" class="num" data-i18n="th.gain">Gain</th></tr></thead>
       <tbody>
-        <tr><td>All pairs</td><td class="num">8.6&nbsp;min</td><td class="num">2.9&nbsp;s</td><td class="num">178&times;</td></tr>
-        <tr><td>The 1,000 most frequent pairs</td><td class="num">3.8&nbsp;min</td><td class="num">0.89&nbsp;s</td><td class="num">255&times;</td></tr>
+        <tr><td data-i18n="server.all">All pairs</td><td class="num">8.6&nbsp;min</td><td class="num">2.9&nbsp;s</td><td class="num">178&times;</td></tr>
+        <tr><td data-i18n="server.top">The 1,000 most frequent pairs</td><td class="num">3.8&nbsp;min</td><td class="num">0.89&nbsp;s</td><td class="num">255&times;</td></tr>
       </tbody>
     </table>
-    <p class="note">SPALM, an in-database linear algebra system, takes 54.3&nbsp;s for all pairs.</p>
+    <p class="note" data-i18n="server.note">SPALM, an in-database linear algebra system, takes 54.3&nbsp;s for all pairs.</p>
   </section>
 
   <footer>
-    <p>Data: the NYTimes collection of <a href="https://archive.ics.uci.edu/dataset/164/bag+of+words">Bag of Words</a>,
+    <p data-i18n-html="foot.data">Data: the NYTimes collection of <a href="https://archive.ics.uci.edu/dataset/164/bag+of+words">Bag of Words</a>,
     UCI Machine Learning Repository, D. Newman (CC BY 4.0), 10,000 of its 300,000 articles chosen at random. Words are
     stored as numbers and shown as text. DuckDB-WASM <span id="duckwasm">1.32.0</span> loads from jsDelivr, and Tessera
     <span id="tessfoot">1.2.1</span> is compiled with Emscripten for one thread. Queries run in this page and send nothing
     anywhere.</p>
-    <p><a href="https://github.com/GyuyeongKim/Tessera-public">Tessera on GitHub</a></p>
+    <p><a href="https://github.com/GyuyeongKim/Tessera-public" data-i18n="foot.github">Tessera on GitHub</a></p>
   </footer>
 </main>
-<script type="module" src="app.js"></script>
+<script type="module" src="app.js?v=c2c4c2fac1"></script>
 </body>
 </html>

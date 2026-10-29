@@ -1,6 +1,6 @@
-import TesseraModule from './tessera.js';
-import { decode } from './dataset.js';
-import { runTessera } from './tessera_run.js';
+import TesseraModule from './tessera.js?v=d022353133';
+import { decode } from './dataset.js?v=afa3a41209';
+import { runTessera } from './tessera_run.js?v=03e342dc8c';
 
 let M, bytes;
 

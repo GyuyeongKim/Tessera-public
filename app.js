@@ -1,11 +1,24 @@
-import { decode } from './dataset.js';
-import { openDuck, loadBase, useArticles, runDuck } from './duck_run.js';
+import { decode } from './dataset.js?v=afa3a41209';
+import { openDuck, loadBase, useArticles, runDuck } from './duck_run.js?v=5cd050b38b';
+import { dict } from './i18n.js?v=f3a48692d3';
 
 const SIZES = [1000, 2000, 5000, 10000];
 const fmt = new Intl.NumberFormat('en-US');
 const $ = (id) => document.getElementById(id);
 const state = { articles: 2000, query: 'top', pct: 2, busy: true };
 let words = [], stats = {}, duck = null, duckArticles = 0, tess = null, nextId = 1;
+let lang = document.documentElement.lang === 'ko' ? 'ko' : 'en', dark = false, tessVersion = null;
+const live = new Map();
+
+function t(key, vars = {}) {
+  return (dict[lang][key] ?? dict.en[key]).replace(/\{(\w+)\}/g, (_, k) => vars[k]);
+}
+
+function say(id, key, vars = {}, html = false) {
+  if (key) live.set(id, { key, vars, html }); else live.delete(id);
+  const s = key ? t(key, vars) : '';
+  if (html) $(id).innerHTML = s; else $(id).textContent = s;
+}
 
 function seconds(ms) {
   if (ms < 1000) return `${(ms / 1000).toFixed(3)}\u00a0s`;
@@ -48,18 +61,17 @@ function renderControls() {
     return b;
   }));
   const s = stats[state.articles];
-  $('sizeinfo').textContent = s ? `${fmt.format(s.rows)} rows, ${fmt.format(s.joined)} joined rows` : '';
-  $('joinedrows').textContent = s ? fmt.format(s.joined) : 'millions of';
+  $('sizeinfo').textContent = s ? t('sizeinfo', { rows: fmt.format(s.rows), joined: fmt.format(s.joined) }) : '';
+  $('joinedrows').textContent = s ? fmt.format(s.joined) : t('joined.many');
   $('sql').textContent = sql();
   $('run').disabled = state.busy;
   for (const el of document.querySelectorAll('input[name=q], #pct')) el.disabled = state.busy;
 }
 
-function lane(which, time, text, bad) {
+function lane(which, time, key, vars, bad) {
   $(`${which}time`).textContent = time;
-  const st = $(`${which}state`);
-  st.textContent = text;
-  st.classList.toggle('bad', !!bad);
+  say(`${which}state`, key, vars);
+  $(`${which}state`).classList.toggle('bad', !!bad);
 }
 
 function ticker(which) {
@@ -88,8 +100,8 @@ function sameTop(duckRows, tessTop) {
   return duckRows.every((r, i) => r.w1 === tessTop[i][0] && r.w2 === tessTop[i][1] && Number(r.n) === tessTop[i][2]);
 }
 
-function showRows(top, summary) {
-  $('summary').textContent = summary;
+function showRows(top, key, vars) {
+  say('summary', key, vars);
   $('rows').replaceChildren(...top.map(([a, b, n], i) => {
     const tr = document.createElement('tr');
     tr.innerHTML = `<td>${i + 1}</td><td class="pair"></td><td class="num">${fmt.format(n)}</td>`;
@@ -107,46 +119,44 @@ function showRows(top, summary) {
 async function run() {
   state.busy = true;
   renderControls();
-  $('verdict').textContent = '';
+  say('verdict', null);
   $('result').hidden = true;
-  lane('duck', '–', 'Waiting');
-  lane('tess', '–', 'Running');
+  lane('duck', '–', 'lane.waiting');
+  lane('tess', '–', 'lane.running');
   const articles = state.articles, query = state.query, text = sql();
   if (duckArticles !== articles) {
-    $('status').textContent = 'Preparing the table in DuckDB…';
+    say('status', 'status.table');
     await useArticles(duck, articles);
     duckArticles = articles;
   }
-  $('status').textContent = 'Running Tessera, then DuckDB, one after the other.';
+  say('status', 'status.running');
   let stop = ticker('tess');
-  const t = await runTess(articles, tessOpts());
+  const r = await runTess(articles, tessOpts());
   stop();
-  if (t.type === 'error') lane('tess', '–', t.message, true);
-  else lane('tess', seconds(t.ms), 'Done');
-  lane('duck', '0.000\u00a0s', 'Running');
+  if (r.type === 'error') lane('tess', '–', 'raw', { s: r.message }, true);
+  else lane('tess', seconds(r.ms), 'lane.done');
+  lane('duck', '0.000\u00a0s', 'lane.running');
   stop = ticker('duck');
   const d = await runDuck(duck, text);
   stop();
   const oom = d.error && /out of memory/i.test(d.error);
-  if (d.error) lane('duck', seconds(d.ms), oom ? 'Out of memory: a browser page has about 3\u00a0GB' : d.error, true);
-  else lane('duck', seconds(d.ms), 'Done');
+  if (d.error) lane('duck', seconds(d.ms), oom ? 'lane.oom' : 'raw', { s: d.error }, true);
+  else lane('duck', seconds(d.ms), 'lane.done');
 
-  const v = $('verdict');
-  if (t.type !== 'error' && !d.error) {
-    const same = sameTop(d.rows, t.top) && (query === 'top' || (Number(d.rows[0]?.pairs ?? 0) === t.cells && Number(d.rows[0]?.total ?? 0) === t.sum));
-    const gain = d.ms / t.ms;
-    v.innerHTML = same
-      ? `<span class="same">Same answer.</span> Tessera was <span class="x">${gain >= 10 ? Math.round(gain) : gain.toFixed(1)}&times;</span> faster.`
-      : 'The answers differ.';
-    const summary = query === 'top' ? `The 10 most frequent pairs among ${fmt.format(articles)} articles.`
-      : `${fmt.format(t.cells)} pairs${query === 'having' ? ` in at least ${fmt.format(tau())} articles` : ''}, ${fmt.format(t.sum)} co-occurrences in all. The 10 most frequent:`;
-    showRows(t.top, summary);
-  } else if (t.type !== 'error' && oom) {
-    v.innerHTML = `DuckDB ran out of memory after ${seconds(d.ms)}. Tessera answered in <span class="x">${seconds(t.ms)}</span>.`;
-    showRows(t.top, query === 'top' ? `Tessera's 10 most frequent pairs among ${fmt.format(articles)} articles.`
-      : `Tessera found ${fmt.format(t.cells)} pairs. The 10 most frequent:`);
+  const n = fmt.format(articles), cells = fmt.format(r.cells), sum = fmt.format(r.sum);
+  if (r.type !== 'error' && !d.error) {
+    const same = sameTop(d.rows, r.top) && (query === 'top' || (Number(d.rows[0]?.pairs ?? 0) === r.cells && Number(d.rows[0]?.total ?? 0) === r.sum));
+    const gain = d.ms / r.ms;
+    if (same) say('verdict', 'verdict.same', { gain: gain >= 10 ? Math.round(gain) : gain.toFixed(1) }, true);
+    else say('verdict', 'verdict.differ', {}, true);
+    if (query === 'top') showRows(r.top, 'sum.top', { n });
+    else if (query === 'having') showRows(r.top, 'sum.having', { cells, tau: fmt.format(tau()), sum });
+    else showRows(r.top, 'sum.all', { cells, sum });
+  } else if (r.type !== 'error' && oom) {
+    say('verdict', 'verdict.oom', { duck: seconds(d.ms), tess: seconds(r.ms) }, true);
+    showRows(r.top, query === 'top' ? 'sum.oomtop' : 'sum.oom', { n, cells });
   }
-  $('status').textContent = 'Ready. Change the articles or the query and run again.';
+  say('status', 'status.again');
   state.busy = false;
   renderControls();
 }
@@ -159,24 +169,52 @@ async function gunzip(url) {
   return new Uint8Array(await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
 }
 
-function setTheme(t) {
-  document.documentElement.dataset.theme = t;
-  try { localStorage.setItem('theme', t); } catch (e) {}
-  $('theme').textContent = t === 'dark' ? 'Light' : 'Dark';
+function setTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem('theme', theme); } catch (e) {}
+  dark = theme === 'dark';
+  $('theme').textContent = t(dark ? 'theme.light' : 'theme.dark');
+}
+
+function applyLang() {
+  document.documentElement.lang = lang;
+  document.title = t('title');
+  document.querySelector('meta[name=description]').content = t('description');
+  for (const el of document.querySelectorAll('[data-i18n]')) el.textContent = t(el.dataset.i18n);
+  for (const el of document.querySelectorAll('[data-i18n-html]')) el.innerHTML = t(el.dataset.i18nHtml);
+  for (const el of document.querySelectorAll('[data-i18n-aria]')) el.setAttribute('aria-label', t(el.dataset.i18nAria));
+  $('lang').textContent = t('other');
+  $('lang').lang = t('otherLang');
+  $('lang').setAttribute('aria-label', t('aria.lang'));
+  $('theme').textContent = t(dark ? 'theme.light' : 'theme.dark');
+  for (const [id, { key, vars, html }] of live) say(id, key, vars, html);
+  if (tessVersion) $('tessfoot').textContent = tessVersion;
+  renderControls();
+}
+
+function setLang(next) {
+  lang = next;
+  try { localStorage.setItem('lang', lang); } catch (e) {}
+  const url = new URL(location.href);
+  if (url.searchParams.has('lang')) { url.searchParams.set('lang', lang); history.replaceState(null, '', url); }
+  applyLang();
 }
 
 async function main() {
-  const dark = document.documentElement.dataset.theme === 'dark' ||
+  dark = document.documentElement.dataset.theme === 'dark' ||
     (!document.documentElement.dataset.theme && matchMedia('(prefers-color-scheme: dark)').matches);
-  $('theme').textContent = dark ? 'Light' : 'Dark';
-  $('theme').onclick = () => setTheme($('theme').textContent === 'Dark' ? 'dark' : 'light');
+  $('theme').onclick = () => setTheme(dark ? 'light' : 'dark');
+  $('lang').onclick = () => setLang(lang === 'ko' ? 'en' : 'ko');
+  say('status', 'status.loading');
+  lane('duck', '–', 'lane.waiting');
+  lane('tess', '–', 'lane.waiting');
+  applyLang();
   for (const r of document.querySelectorAll('input[name=q]')) r.onchange = () => { state.query = r.value; renderControls(); };
   $('pct').onchange = (e) => { state.pct = Number(e.target.value); renderControls(); };
   $('run').onclick = run;
-  renderControls();
   try {
-    const bytes = await gunzip('data/nytimes.bin.gz');
-    words = new TextDecoder().decode(await gunzip('data/words.txt.gz')).split('\n');
+    const bytes = await gunzip('data/nytimes.bin.gz?v=6a6ecf908e');
+    words = new TextDecoder().decode(await gunzip('data/words.txt.gz?v=5e6ff6f0d1')).split('\n');
     const all = decode(bytes);
     const len = new Int32Array(all.articles);
     for (let i = 0; i < all.rows; i++) len[all.k[i]]++;
@@ -186,22 +224,23 @@ async function main() {
       stats[n] = { rows, joined };
     }
     renderControls();
-    tess = new Worker('tessera_worker.js', { type: 'module' });
+    tess = new Worker('tessera_worker.js?v=632db4898a', { type: 'module' });
     const ready = new Promise(res => tess.addEventListener('message', e => { if (e.data.type === 'ready') res(e.data); }, { once: true }));
     tess.postMessage({ type: 'init', bytes: bytes.slice() });
-    $('status').textContent = 'Loading DuckDB-WASM (about 5\u00a0MB)…';
+    say('status', 'status.duck');
     duck = await openDuck();
     $('duckver').textContent = duck.version.replace(/^v/, '') + ' (WASM)';
-    $('status').textContent = 'Loading the articles into DuckDB…';
+    say('status', 'status.base');
     await loadBase(duck, all);
     const r = await ready;
+    tessVersion = r.version;
     $('tessver').textContent = `${r.version} (WASM)`;
     $('tessfoot').textContent = r.version;
-    $('status').textContent = 'Ready.';
+    say('status', 'status.ready');
     state.busy = false;
     renderControls();
   } catch (err) {
-    $('status').textContent = `Could not start: ${err && err.message || err}`;
+    say('status', 'status.failed', { e: err && err.message || err });
   }
 }
 
