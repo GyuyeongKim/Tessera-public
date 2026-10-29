@@ -75,7 +75,7 @@ On the same full products in DuckDB, Tessera is also 5.8–34× faster than SPAL
 linear algebra (54.3 s against 2.9 s on the news articles). Release 1.1.1 reruns the DuckDB measurements
 ([Reproducing the main results](#reproducing-the-main-results)).
 
-> Measured with release 1.1 on one socket (16 cores) of an Intel Xeon Silver 4514Y with AMX, with each engine and
+> Measured with release 1.1 on 16 cores of an Intel Xeon Silver 4514Y with AMX, with each engine and
 > Tessera on the same cores: DuckDB v1.3.2, PostgreSQL 18.6, SQLite 3.54.1, and Spark 4.2.0. The queries count all pairs of values with
 > `COUNT(*)`. SQLite runs its own plan on one thread, and with one thread Tessera is still 99–260× faster there.
 > Data: [NYTimes](https://archive.ics.uci.edu/dataset/164/bag+of+words), [MovieLens 32M](https://grouplens.org/datasets/movielens/32m/), and [human_gene1](https://sparse.tamu.edu/Belcastro/human_gene1).
