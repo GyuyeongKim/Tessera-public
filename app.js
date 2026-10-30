@@ -1,6 +1,6 @@
 import { decode } from './dataset.js?v=afa3a41209';
 import { openDuck, loadBase, useArticles, runDuck } from './duck_run.js?v=5cd050b38b';
-import { dict } from './i18n.js?v=f96bd1c971';
+import { dict } from './i18n.js?v=e3e654839b';
 
 const SIZES = [1000, 2000, 5000, 10000];
 const fmt = new Intl.NumberFormat('en-US');
@@ -200,11 +200,22 @@ function setLang(next) {
   applyLang();
 }
 
+async function copyBib() {
+  try {
+    await navigator.clipboard.writeText($('bibtex').textContent);
+    $('copybib').textContent = t('cite.copied');
+    setTimeout(() => { $('copybib').textContent = t('cite.copy'); }, 1500);
+  } catch (e) {
+    getSelection().selectAllChildren($('bibtex'));
+  }
+}
+
 async function main() {
   dark = document.documentElement.dataset.theme === 'dark' ||
     (!document.documentElement.dataset.theme && matchMedia('(prefers-color-scheme: dark)').matches);
   $('theme').onclick = () => setTheme(dark ? 'light' : 'dark');
   $('lang').onclick = () => setLang(lang === 'ko' ? 'en' : 'ko');
+  $('copybib').onclick = copyBib;
   say('status', 'status.loading');
   lane('duck', '–', 'lane.waiting');
   lane('tess', '–', 'lane.waiting');

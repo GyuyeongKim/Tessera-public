@@ -90,9 +90,12 @@ td { border-bottom: 1px solid var(--rule); padding: 7px 8px 7px 0; }
 .pair { font-size: 15px; }
 .pair .plus { color: var(--muted); padding: 0 6px; }
 
-.why, .server { margin-top: 40px; border-top: 1px solid var(--rule); padding-top: 18px; }
+.why, .server, .cite { margin-top: 40px; border-top: 1px solid var(--rule); padding-top: 18px; }
 .why p { max-width: 44em; margin: 0 0 12px; }
 .server .note { margin-top: 10px; }
+.cite p { max-width: 44em; margin: 0 0 12px; }
+.bib { margin: 0 0 8px; padding: 12px 14px; background: var(--soft); border-radius: 8px; font: 13px/1.6 var(--mono); white-space: pre-wrap;
+  overflow-wrap: anywhere; }
 footer { margin-top: 44px; padding-top: 14px; border-top: 1px solid var(--rule); color: var(--muted); font-size: 13px; }
 footer p { margin: 0 0 8px; max-width: 52em; }
 
