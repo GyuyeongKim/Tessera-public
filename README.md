@@ -3,6 +3,7 @@
   <h1>Tessera</h1>
   <p><b>Fast join-aggregates over skewed sparse relations, inside your database engine</b></p>
   <p>
+    <a href="https://arxiv.org/abs/2610.40620"><img src="https://img.shields.io/badge/arXiv-2610.40620-B31B1B" alt="arXiv: 2610.40620"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-2F5E9E" alt="License: Apache-2.0"></a>
     <img src="https://img.shields.io/badge/engines-DuckDB%20%7C%20PostgreSQL%20%7C%20SQLite%20%7C%20Spark-4A4F57" alt="Engines: DuckDB, PostgreSQL, SQLite, Spark">
     <img src="https://img.shields.io/badge/CPU-AMX%20%7C%20AVX--512%20%7C%20AVX2%20%7C%20arm64-E07A5F" alt="CPU: AMX, AVX-512, AVX2, arm64">
@@ -439,9 +440,9 @@ integer sums past 2^53 and the engine's overflow errors.
 
 ## Reproducing the main results
 
-The paper's experiments compare Tessera with SPALM, which runs on DuckDB v1.3.2. Release 1.1.1 keeps that setup and
-its script, which reruns the join-aggregates in DuckDB (Figure 9) and the pruned queries (Figure 10) and draws both
-figures:
+The experiments in the [paper](https://arxiv.org/abs/2610.40620) compare Tessera with SPALM, which runs on DuckDB
+v1.3.2. Release 1.1.1 keeps that setup and its script, which reruns the join-aggregates in DuckDB (Figure 9) and the
+pruned queries (Figure 10) and draws both figures:
 
 ```sh
 git clone --branch v1.1.1 https://github.com/GyuyeongKim/Tessera-public.git Tessera-1.1.1
@@ -462,6 +463,22 @@ Its README lists the steps, the variables, and the time and disk that a run take
 | `tests/` | Correctness tests for the library and the four adapters |
 | `tools/` | The calibration of the cost model (`calibrate.py` and its driver `calibrate_run.c`) |
 | `packaging/` | The PyPI wheel, the PGXN distribution, and the Maven artifacts, which `.github/workflows/release.yml` builds |
+
+## Citation
+
+If you use Tessera, please cite [the paper](https://arxiv.org/abs/2610.40620):
+
+```bibtex
+@misc{kim2026tessera,
+  title={Tessera: Fast Join-Aggregates over Skewed Sparse Relations in Database Engines},
+  author={Gyuyeong Kim},
+  year={2026},
+  eprint={2610.40620},
+  archivePrefix={arXiv},
+  primaryClass={cs.DB},
+  url={https://arxiv.org/abs/2610.40620},
+}
+```
 
 ## License
 
