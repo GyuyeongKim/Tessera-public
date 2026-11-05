@@ -235,7 +235,7 @@ async function main() {
       stats[n] = { rows, joined };
     }
     renderControls();
-    tess = new Worker('tessera_worker.js?v=632db4898a', { type: 'module' });
+    tess = new Worker('tessera_worker.js?v=e6660d2cae', { type: 'module' });
     const ready = new Promise(res => tess.addEventListener('message', e => { if (e.data.type === 'ready') res(e.data); }, { once: true }));
     tess.postMessage({ type: 'init', bytes: bytes.slice() });
     say('status', 'status.duck');

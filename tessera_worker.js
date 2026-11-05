@@ -1,4 +1,4 @@
-import TesseraModule from './tessera.js?v=d022353133';
+import TesseraModule from './tessera.js?v=2b2d981496';
 import { decode } from './dataset.js?v=afa3a41209';
 import { runTessera } from './tessera_run.js?v=03e342dc8c';
 
