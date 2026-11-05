@@ -256,7 +256,7 @@ On macOS, install LLVM's OpenMP runtime and point the compiler at it:
 
 ```sh
 brew install libomp
-export CPPFLAGS="-I$(brew --prefix libomp)/include" LDFLAGS="-L$(brew --prefix libomp)/lib"
+export CMAKE_PREFIX_PATH="$(brew --prefix libomp)"
 ```
 
 The loadable extension then carries the runtime and needs no libomp where it runs. LLVM's runtime stops a process
