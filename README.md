@@ -11,6 +11,20 @@
   <img src="assets/overview.svg" width="860" alt="Tessera runs a join-aggregate as a sparse product with a dense core on AMX">
 </div>
 
+## News
+
+- **[2026/11]** Tessera 1.3.0 runs many more join-aggregate forms: `<>` and `IS DISTINCT FROM` between the two sides,
+  `COUNT(DISTINCT k)`, `AVG`, keys and groups of several columns or computed from a column, NULL groups, filters on
+  the inputs, and date, timestamp, and decimal columns. PostgreSQL and Spark now prune with `HAVING` and
+  `ORDER BY ... LIMIT` too. See [Supported queries](#supported-queries).
+- **[2026/11]** Tessera is a [DuckDB community extension](https://duckdb.org/community_extensions/extensions/tessera.html):
+  `INSTALL tessera FROM community; LOAD tessera;`
+- **[2026/10]** The paper is on [arXiv](https://arxiv.org/abs/2610.40620).
+- **[2026/10]** Packages on [PyPI](https://pypi.org/project/sqlite-tessera/),
+  [Maven Central](https://central.sonatype.com/artifact/io.github.gyuyeongkim/tessera-spark_2.13), and
+  [PGXN](https://pgxn.org/dist/tessera_pg/), and a [browser demo](https://gyuyeongkim.github.io/Tessera-public/).
+- **[2026/10]** Tessera released! The operator and its adapters for DuckDB, PostgreSQL, SQLite, and Spark.
+
 ## What it does
 
 **Tessera speeds up join-aggregates inside database engines by up to three orders of magnitude, with the same SQL and
@@ -41,7 +55,7 @@ answer.
 |---|---|
 | **No joined rows** | Computes the result as the matrix product XᵀX, where X has one row per key and one column per value, in one pass over the input. |
 | **Sparse first** | Computes each pair of values once in a dense array of counters and writes only the nonzero cells. Results larger than the memory limit go to disk. |
-| **Pruning** | With `HAVING` or `ORDER BY ... LIMIT`, drops the values that cannot reach the threshold before any product, so stricter queries run faster. Results stay exact. DuckDB passes both forms, PostgreSQL `HAVING`, and SQLite its `min` argument; Spark runs these queries unpruned. |
+| **Pruning** | With `HAVING` or `ORDER BY ... LIMIT`, drops the values that cannot reach the threshold before any product, so stricter queries run faster. Results stay exact. DuckDB, PostgreSQL, and Spark pass both forms, and SQLite its `min` argument. |
 | **Dense core on AMX** | Runs the small dense block of the most frequent values as 8-bit tiles on the CPU matrix accelerator. |
 | **Exact integer sums** | Sums integer weights exactly, in 64 or 128 bits, and raises the engine's own overflow error wherever the engine's plan would. |
 | **Cost-based frontier** | The two paths meet at the dense frontier, which a cost model places for each query where an accelerator tile costs as much as the sparse products it replaces. Pruning runs first, so the frontier follows the query, and it stays empty when no block pays off. |
@@ -89,7 +103,7 @@ linear algebra (54.3 s against 2.9 s on the news articles). Release 1.1.1 reruns
 | SQLite | `tessera-sqlite-<version>-<platform>.tar.gz` on the [releases page](https://github.com/GyuyeongKim/Tessera-public/releases) | `.load ./tessera` in the shell |
 | Spark | `io.github.gyuyeongkim:tessera-spark_2.13` on Maven Central | `--packages io.github.gyuyeongkim:tessera-spark_2.13:1.3.0` |
 | PostgreSQL | [`tessera_pg`](https://pgxn.org/dist/tessera_pg/) on PGXN | `pgxn install tessera_pg` |
-| DuckDB | Source | [Engines](#engines) |
+| DuckDB | [`tessera`](https://duckdb.org/community_extensions/extensions/tessera.html) in the community extensions | `INSTALL tessera FROM community; LOAD tessera;` |
 
 The binary packages are built for Linux on x86-64 and macOS on Apple silicon. In Python:
 
@@ -297,7 +311,7 @@ of one query), `tessera.frontier` (`-1`), `tessera.min_expansion` and `tessera.m
 estimated joined rows per input row, from the `ANALYZE` statistics, lie below the limit stays with PostgreSQL), and
 `tessera.trace` (phase times in the server log). The output may use
 `work_mem * hash_mem_multiplier` in memory, and the rest goes to the first of `temp_tablespaces` within
-`temp_file_limit`. For text values with `a.x < b.x`, use the `C` collation, since Tessera orders strings by bytes.
+`temp_file_limit`. With `a.x < b.x` on text, Tessera orders the values by the comparison's collation.
 
 </details>
 
@@ -380,7 +394,8 @@ exports only the C interface.
 <details>
 <summary>Arguments and other calls</summary>
 
-The arguments of `tessera_c_run` are the pair filter (`0` all ordered pairs, `1` `a.x < b.x`, `2` `a.x <= b.x`),
+The arguments of `tessera_c_run` are the pair filter (`0` all ordered pairs, `1` `a.x < b.x`, `2` `a.x <= b.x`, `3`
+`a.x <> b.x`),
 whether column 0 holds the smaller value (`0` for `>` and `>=`), the `HAVING` threshold (`0` for none), the top-k
 limit (`-1` for none), the thread count (`0` for all CPUs), the frontier (`-1` for the cost model), and a flag that
 prints phase times to stderr. The threshold and the top-k limit only prune, so keep your own filter on the rows.
@@ -391,10 +406,13 @@ prints phase times to stderr. The threshold and the top-k limit only prune, so k
 | `tessera_c_overflow` | Whether a product or a sum leaves the range of the engine's integer types |
 | `tessera_c_wide`, `tessera_c_next_batch128` | Integer sums that need more than 64 bits |
 | `tessera_c_new_cross`, `tessera_c_add_y` | A product of two relations |
-| `tessera_dict_new`, `tessera_dict_code`, `tessera_c_set_xdict`, `tessera_c_xstr` | String keys and values |
+| `tessera_dict_new`, `tessera_dict_code`, `tessera_c_set_xdict`, `tessera_c_set_ydict`, `tessera_c_xstr`, `tessera_c_ystr` | String keys and values |
 | `tessera_c_set_memory`, `tessera_c_set_spill_limit` | Memory limit of the output, the directory for the rest, and its size limit |
 | `tessera_c_set_stop`, `tessera_c_cancel` | Cancellation |
 | `tessera_c_set_similarity` | Similarity measure (1 cosine, 2 Jaccard, 3 Dice, 4 overlap) and threshold |
+| `tessera_c_set_distinct_keys` | `COUNT(DISTINCT a.k)`: each shared key counts once per pair |
+| `tessera_c_set_two`, `tessera_c_next_batch2` | A count and a sum of the same pairs in one run |
+| `tessera_c_set_pair_filter` | Overflow checks that count only the pairs passing the caller's filters |
 | `tessera_c_general` | Whether the values come back as doubles (`vd`) rather than integers (`vi`) |
 
 Repeated rows with the same key and value are merged first. Integer weights (`tessera_c_add_i64`) and every
