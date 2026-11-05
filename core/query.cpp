@@ -81,7 +81,7 @@ int64_t StrDict::code(const char *s, size_t len) {
 		}
 	}
 	const size_t c = size();
-	if (c >= kCodeMask) {
+	if ((uint64_t)c >= kCodeMask) {
 		throw std::length_error("tessera: a dictionary of more than 2^40 strings");
 	}
 	if ((c + 1) * 2 > slot_.size()) {

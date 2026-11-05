@@ -88,6 +88,24 @@ static Expression &WithoutDecimalWidening(Expression &e) {
 	return e;
 }
 
+static Expression *WithoutIntegerWidening(Expression *e) {
+	if (!BoundCastExpression::IsCast(*e)) {
+		return e;
+	}
+	auto &f = e->Cast<BoundFunctionExpression>();
+	auto &child = const_cast<Expression &>(BoundCastExpression::Child(f));
+	const auto &from = child.GetReturnType(), &to = e->GetReturnType();
+	if (!IsIntegerKey(from) || !IsIntegerKey(to) || BoundCastExpression::IsTryCast(f)) {
+		return e;
+	}
+	const auto unsigned_type = [](const LogicalType &t) {
+		return t.id() == LogicalTypeId::UTINYINT || t.id() == LogicalTypeId::USMALLINT || t.id() == LogicalTypeId::UINTEGER;
+	};
+	const idx_t fb = GetTypeIdSize(from.InternalType()), tb = GetTypeIdSize(to.InternalType());
+	const bool widens = unsigned_type(from) == unsigned_type(to) ? tb >= fb : unsigned_type(from) && tb > fb;
+	return widens ? &child : e;
+}
+
 static bool IsDecimalWeight(const LogicalType &t) {
 	return t.id() == LogicalTypeId::DECIMAL && DecimalType::GetWidth(t) <= 18;
 }
@@ -1284,13 +1302,17 @@ static bool TryTesseraCross(ClientContext &context, unique_ptr<LogicalOperator> 
 	vector<LogicalType> kxt, kyt;
 	vector<shared_ptr<Expression>> kxe, kye;
 	for (auto &cond : join.conditions) {
-		auto le = ToScan(&cond.GetLHS(), scan_l, scan_r, true), re = ToScan(&cond.GetRHS(), scan_l, scan_r, true);
+		const bool eq = cond.GetComparisonType() == ExpressionType::COMPARE_EQUAL;
+		const auto side_expr = [&](Expression &e) {
+			auto *c = ToScan(eq ? &e : WithoutIntegerWidening(&e), scan_l, scan_r, true);
+			return eq || !c ? c : WithoutIntegerWidening(c);
+		};
+		auto le = side_expr(cond.GetLHS()), re = side_expr(cond.GetRHS());
 		int sl, sr;
 		idx_t cl, cr;
 		ColumnBinding bl, br;
 		shared_ptr<Expression> el, er;
 		const vector<Layer> none;
-		const bool eq = cond.GetComparisonType() == ExpressionType::COMPARE_EQUAL;
 		if ((!le || !SideOf(*le, gl, gr, sl, cl, bl)) &&
 		    !(eq && (el = ComputedGroup(context, cond.GetLHS(), none, scan_l, scan_r, gl, gr, sl)))) {
 			return false;

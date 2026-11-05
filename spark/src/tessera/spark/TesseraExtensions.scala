@@ -189,10 +189,7 @@ object TesseraStrategy extends SparkStrategy with PredicateHelper {
 
   private def isInt(t: DataType): Boolean = t == IntegerType || t == LongType || t == ShortType
 
-  private def unstage(p: LogicalPlan): LogicalPlan = p match {
-    case s: LogicalQueryStage => s.logicalPlan
-    case other => other
-  }
+  def unstage(p: LogicalPlan): LogicalPlan = p.transformDown { case s: LogicalQueryStage => unstage(s.logicalPlan) }
   def sameInput(l: LogicalPlan, r: LogicalPlan): Boolean = unstage(l).sameResult(unstage(r))
 
   private def isKey(t: DataType): Boolean = isInt(t) || t == StringType || TesseraCross.isTemporal(t)
@@ -346,14 +343,18 @@ object TesseraPairFilter {
   }
 }
 
-final class TesseraPairFilter(h: Long, s: TesseraCrossSpec) {
-  private lazy val xd = if (s.xDict) (TesseraNative.xStringBytes(h), TesseraNative.xStringOffsets(h)) else (null, null)
-  private lazy val yd = if (s.yDict && !s.symmetric) (TesseraNative.yStringBytes(h), TesseraNative.yStringOffsets(h))
+final class TesseraPairFilter(h: Long, s: TesseraCrossSpec, xPack: TesseraPacking, yPack: TesseraPacking) {
+  private lazy val xd = if (s.xDict && xPack == null) (TesseraNative.xStringBytes(h), TesseraNative.xStringOffsets(h))
+                        else (null, null)
+  private lazy val yd = if (s.yDict && !s.symmetric && yPack == null) (TesseraNative.yStringBytes(h), TesseraNative.yStringOffsets(h))
                         else xd
   def pass(a: Long, b: Long): Boolean = (0 until (if (s.symmetric) 2 else 1)).exists { o =>
-    val xc = TesseraPairFilter.cols(if (o == 0) a else b, s.xDict, xd._1, xd._2, s.xTypes, s.xNull)
-    val yc = TesseraPairFilter.cols(if (o == 0) b else a, s.yDict, yd._1, yd._2, s.yTypes,
-      if (s.symmetric) s.xNull else s.yNull)
+    val xv = if (o == 0) a else b
+    val yv = if (o == 0) b else a
+    val xc = if (xPack != null) xPack.unpack(xv) else TesseraPairFilter.cols(xv, s.xDict, xd._1, xd._2, s.xTypes, s.xNull)
+    val yc = if (yPack != null) yPack.unpack(yv)
+             else TesseraPairFilter.cols(yv, s.yDict, yd._1, yd._2, s.yTypes,
+               if (s.symmetric) s.xNull else s.yNull)
     s.filters.forall { case (xi, yi, op) => TesseraPairFilter.pass(xc(xi), yc(yi), op) }
   }
 }
@@ -457,6 +458,91 @@ object TesseraTuple {
         s
       } else b.getLong(): Any
     }.toArray
+  }
+}
+
+final case class TesseraPacking(mins: Array[Long], shifts: Array[Int], widths: Array[Int], nulls: Array[Boolean]) {
+  def pack(b: Array[Byte], o: Array[Int], n: Int): Array[Long] = {
+    val out = new Array[Long](n)
+    var i = 0
+    while (i < n) {
+      var q = o(i)
+      var code = 0L
+      var c = 0
+      while (c < mins.length) {
+        var f = 0L
+        if (nulls(c) && b(q) == 0) q += 1
+        else {
+          if (nulls(c)) q += 1
+          f = TesseraPacking.le(b, q) - mins(c) + (if (nulls(c)) 1L else 0L)
+          q += 8
+        }
+        code |= f << shifts(c)
+        c += 1
+      }
+      out(i) = code
+      i += 1
+    }
+    out
+  }
+  def unpack(v: Long): Array[Any] = {
+    val r = new Array[Any](mins.length)
+    var c = 0
+    while (c < mins.length) {
+      val f = (v >>> shifts(c)) & ((1L << widths(c)) - 1)
+      r(c) = if (nulls(c) && f == 0) null else f - (if (nulls(c)) 1L else 0L) + mins(c)
+      c += 1
+    }
+    r
+  }
+}
+
+object TesseraPacking {
+  def le(b: Array[Byte], q: Int): Long = {
+    var v = 0L
+    var i = 7
+    while (i >= 0) { v = (v << 8) | (b(q + i) & 0xffL); i -= 1 }
+    v
+  }
+  def of(parts: Seq[(Array[Byte], Array[Int], Int)], types: Seq[DataType], nullable: Seq[Boolean]): TesseraPacking = {
+    if (!types.forall(TesseraCross.heldAsLong)) return null
+    val nc = types.size
+    val nulls = if (nullable.isEmpty) Array.fill(nc)(false) else nullable.toArray
+    val mn = Array.fill(nc)(Long.MaxValue)
+    val mx = Array.fill(nc)(Long.MinValue)
+    for ((b, o, n) <- parts) {
+      var i = 0
+      while (i < n) {
+        var q = o(i)
+        var c = 0
+        while (c < nc) {
+          if (nulls(c) && b(q) == 0) q += 1
+          else {
+            if (nulls(c)) q += 1
+            val v = le(b, q)
+            q += 8
+            if (v < mn(c)) mn(c) = v
+            if (v > mx(c)) mx(c) = v
+          }
+          c += 1
+        }
+        i += 1
+      }
+    }
+    val widths = new Array[Int](nc)
+    val shifts = new Array[Int](nc)
+    var total = 0
+    for (c <- 0 until nc) {
+      if (mn(c) > mx(c)) { mn(c) = 0L; mx(c) = 0L }
+      val range = mx(c) - mn(c)
+      val top = if (nulls(c)) range + 1 else range
+      if (range < 0 || top < 0) return null
+      widths(c) = 64 - java.lang.Long.numberOfLeadingZeros(top)
+      shifts(c) = total
+      total += widths(c)
+      if (total > 63) return null
+    }
+    TesseraPacking(mn, shifts, widths, nulls)
   }
 }
 
@@ -578,7 +664,11 @@ object TesseraCross extends PredicateHelper {
       }
       val kx = ArrayBuffer[Int](); val ky = ArrayBuffer[Int]()
       val filters = ArrayBuffer[(Int, Int, Int)]()
-      def filter(a: Expression, b: Expression, op: Int): Unit = sides(a, b) match {
+      def widened(e: Expression): Expression = e match {
+        case Cast(a: AttributeReference, t, _, _) if isInt(a.dataType) && isInt(t) && t.defaultSize >= a.dataType.defaultSize => a
+        case _ => e
+      }
+      def filter(a: Expression, b: Expression, op: Int): Unit = sides(widened(a), widened(b)) match {
         case Some((i, k, leftX)) if xIdx.contains(i) && yIdx.contains(k) =>
           val o = if (leftX) op else op match { case 0 => 2; case 1 => 3; case 2 => 0; case 3 => 1; case o => o }
           filters += ((xIdx.indexOf(i), yIdx.indexOf(k), o))
@@ -744,8 +834,16 @@ object TesseraCross extends PredicateHelper {
         if (sumType != LongType && sumType != DoubleType && !(dec && sumType.isInstanceOf[DecimalType])) return None
       }
       if (aggType != LongType && aggType != DoubleType && !(dec && aggType.isInstanceOf[DecimalType])) return None
-      val symmetric = TesseraStrategy.sameInput(xp, yp) && kx == ky && xIdx == yIdx &&
+      val symmetric = TesseraStrategy.sameInput(xp, yp) && kx == ky && xIdx == yIdx && xNull == yNull &&
         (if (hasValue) vIdx >= 0 && vIdx == wIdx else true)
+      if (SQLConf.get.getConfString("spark.tessera.verbose", "false").toBoolean) {
+        System.err.println(s"tessera: general form: same input ${TesseraStrategy.sameInput(xp, yp)}, keys $kx / $ky, " +
+          s"groups $xIdx / $yIdx, NULLs $xNull / $yNull, weights $vIdx / $wIdx: symmetric $symmetric")
+        if (!TesseraStrategy.sameInput(xp, yp)) {
+          System.err.println("tessera: x input " + TesseraStrategy.unstage(xp).canonicalized.treeString.replace('\n', ' '))
+          System.err.println("tessera: y input " + TesseraStrategy.unstage(yp).canonicalized.treeString.replace('\n', ' '))
+        }
+      }
       val proj = if (!project) None else {
         val internal: Seq[Attribute] = parts.toSeq.zipWithIndex.map {
           case (a: AttributeReference, _) => a
@@ -831,50 +929,69 @@ case class TesseraCrossExec(output: Seq[Attribute], spec: TesseraCrossSpec, left
     val yStr = s.yDict
     val xNull = if (s.xNull.isEmpty) s.xIdx.map(_ => false) else s.xNull
     val yNull = if (s.yNull.isEmpty) s.yIdx.map(_ => false) else s.yNull
+    val c = SQLConf.get
+    val verbose = c.getConfString("spark.tessera.verbose", "false").toBoolean
+    var t0 = System.nanoTime()
+    def phase(name: String): Unit = if (verbose) {
+      val t1 = System.nanoTime()
+      System.err.println(f"tessera: general form: $name ${(t1 - t0) / 1e9}%.3f s")
+      t0 = t1
+    }
     val xs = TesseraCross.collect(left, s.kx, s.kxTypes, s.xIdx, s.xTypes, s.vIdx, s.vType, s.hasValue, s.vInt, xNull)
     val ys = if (s.symmetric) Array.empty[TesseraPart]
              else TesseraCross.collect(right, s.ky, s.kyTypes, s.yIdx, s.yTypes, s.wIdx, s.wType, s.hasValue, s.vInt, yNull)
-    val c = SQLConf.get
+    phase(s"collect (symmetric ${s.symmetric})")
     val threads = TesseraConf.threads(c)
     val alive = org.apache.spark.sql.tessera.TesseraStatement.alive(sparkContext)
-    val verbose = c.getConfString("spark.tessera.verbose", "false").toBoolean
+    def bytesOf(ps: Array[TesseraPart], key: Boolean) = ps.toSeq.filter(_.n > 0).map(p => if (key) (p.kBytes, p.kOffs, p.n) else (p.xBytes, p.xOffs, p.n))
+    val kPack = if (kStr && s.kx.size > 1 && s.kyTypes.forall(TesseraCross.heldAsLong))
+                  TesseraPacking.of(bytesOf(xs, true) ++ bytesOf(ys, true), s.kxTypes, Nil) else null
+    val xPack = if (xStr) TesseraPacking.of(bytesOf(xs, false), s.xTypes, xNull) else null
+    val yPack = if (s.symmetric) xPack else if (yStr) TesseraPacking.of(bytesOf(ys, false), s.yTypes, yNull) else null
+    val xUse = xStr && xPack == null
+    val yUse = yStr && yPack == null
+    phase(s"pack (keys ${kPack != null}, x ${xPack != null}, y ${yPack != null})")
     val h = TesseraRun.handle(if (s.symmetric) TesseraNative.create(s.hasValue) else TesseraNative.createCross(s.hasValue),
       "query handle")
     var dk, dx, dy = 0L
     try {
-      if (kStr) dk = TesseraRun.handle(TesseraNative.dictNew(), "dictionary")
-      if (xStr) dx = TesseraRun.handle(TesseraNative.dictNew(), "dictionary")
-      if (yStr && !s.symmetric) dy = TesseraRun.handle(TesseraNative.dictNew(), "dictionary")
+      if (kStr && kPack == null) dk = TesseraRun.handle(TesseraNative.dictNew(), "dictionary")
+      if (xUse) dx = TesseraRun.handle(TesseraNative.dictNew(), "dictionary")
+      if (yUse && !s.symmetric) dy = TesseraRun.handle(TesseraNative.dictNew(), "dictionary")
       def codes(d: Long, b: Array[Byte], o: Array[Int], n: Int): Array[Long] = {
         val out = new Array[Long](n)
         if (TesseraNative.dictCode(d, b, o, n, out) != 0) throw new IllegalStateException("tessera: out of memory (dictionary)")
         out
       }
+      def keys(p: TesseraPart) = if (kPack != null) kPack.pack(p.kBytes, p.kOffs, p.n)
+                                 else if (kStr) codes(dk, p.kBytes, p.kOffs, p.n) else p.k
       for (p <- xs if p.n > 0) {
-        val k = if (kStr) codes(dk, p.kBytes, p.kOffs, p.n) else p.k
-        val x = if (xStr) codes(dx, p.xBytes, p.xOffs, p.n) else p.x
+        val k = keys(p)
+        val x = if (xPack != null) xPack.pack(p.xBytes, p.xOffs, p.n) else if (xStr) codes(dx, p.xBytes, p.xOffs, p.n) else p.x
         if ((if (s.vInt) TesseraNative.addI64(h, k, x, p.iv, p.n) else TesseraNative.add(h, k, x, p.v, p.n)) != 0)
           throw new IllegalStateException("tessera: out of memory (rows)")
       }
       for (p <- ys if p.n > 0) {
-        val k = if (kStr) codes(dk, p.kBytes, p.kOffs, p.n) else p.k
-        val y = if (yStr) codes(dy, p.xBytes, p.xOffs, p.n) else p.x
+        val k = keys(p)
+        val y = if (yPack != null) yPack.pack(p.xBytes, p.xOffs, p.n) else if (yStr) codes(dy, p.xBytes, p.xOffs, p.n) else p.x
         if ((if (s.vInt) TesseraNative.addYI64(h, k, y, p.iv, p.n) else TesseraNative.addY(h, k, y, p.v, p.n)) != 0)
           throw new IllegalStateException("tessera: out of memory (rows)")
       }
-      if (xStr) TesseraNative.setXDict(h, dx)
-      if (yStr && !s.symmetric) TesseraNative.setYDict(h, dy)
+      if (xUse) TesseraNative.setXDict(h, dx)
+      if (yUse && !s.symmetric) TesseraNative.setYDict(h, dy)
+      phase("code and add")
       if (s.distinctKeys) TesseraNative.setDistinctKeys(h, true)
       if (s.two) TesseraNative.setTwo(h, true)
       val rowSums = s.vInt && s.ansi && !s.dec && s.filters.nonEmpty
       val pvt = if (s.vIdx >= 0) s.vType else s.wType
-      if (rowSums) TesseraNative.setPairFilter(h, new TesseraPairFilter(h, s), if (pvt == LongType) 64 else 32)
+      if (rowSums) TesseraNative.setPairFilter(h, new TesseraPairFilter(h, s, xPack, yPack), if (pvt == LongType) 64 else 32)
       TesseraRun.run(h, alive, TesseraNative.run(h, 0, true, s.minValue, s.topk, threads, -1L, verbose))
+      phase("run")
       if (s.vInt && s.ansi && !s.dec) TesseraEvalModes.check(h, pvt, s.sumCheck && !rowSums)
       val general = TesseraNative.general(h)
-      val xDict = if (xStr) sparkContext.broadcast((TesseraNative.xStringBytes(h), TesseraNative.xStringOffsets(h))) else null
-      val yDict = if (yStr && s.symmetric) xDict
-                  else if (yStr) sparkContext.broadcast((TesseraNative.yStringBytes(h), TesseraNative.yStringOffsets(h))) else null
+      val xDict = if (xUse) sparkContext.broadcast((TesseraNative.xStringBytes(h), TesseraNative.xStringOffsets(h))) else null
+      val yDict = if (yUse && s.symmetric) xDict
+                  else if (yUse) sparkContext.broadcast((TesseraNative.yStringBytes(h), TesseraNative.yStringOffsets(h))) else null
       val chunks = ArrayBuffer[(Array[Long], Array[Long], Array[Long], Array[Double], Int, Array[Long], Array[Long])]()
       var done = false
       while (!done) {
@@ -891,12 +1008,13 @@ case class TesseraCrossExec(output: Seq[Attribute], spec: TesseraCrossSpec, left
         if (n > 0) chunks += ((a, b, vi, vd, n, cnt, hi))
         done = n < a.length
       }
+      phase(s"fetch (${chunks.map(_._5.toLong).sum} rows)")
       val types = output.map(_.dataType).toArray
       sparkContext.parallelize(chunks.toSeq, math.max(1, chunks.size)).mapPartitions { it =>
         val proj = UnsafeProjection.create(types)
         val row = new GenericInternalRow(types.length)
-        val (xb, xo) = if (xStr) xDict.value else (null, null)
-        val (yb, yo) = if (yStr) yDict.value else (null, null)
+        val (xb, xo) = if (xUse) xDict.value else (null, null)
+        val (yb, yo) = if (yUse) yDict.value else (null, null)
         def cols(v: Long, dict: Boolean, b: Array[Byte], o: Array[Long], t: Seq[DataType], nulls: Seq[Boolean]): Array[Any] =
           TesseraPairFilter.cols(v, dict, b, o, t, nulls)
         def typed(v: Any, t: DataType): Any = v match {
@@ -928,8 +1046,8 @@ case class TesseraCrossExec(output: Seq[Attribute], spec: TesseraCrossSpec, left
         }
         it.flatMap { case (a, b, vi, vd, n, cnt, hi) =>
           (0 until n).iterator.flatMap { q =>
-            val xc = cols(a(q), xStr, xb, xo, s.xTypes, xNull)
-            val yc = cols(b(q), yStr, yb, yo, s.yTypes, if (s.symmetric) xNull else yNull)
+            val xc = if (xPack != null) xPack.unpack(a(q)) else cols(a(q), xStr, xb, xo, s.xTypes, xNull)
+            val yc = if (yPack != null) yPack.unpack(b(q)) else cols(b(q), yStr, yb, yo, s.yTypes, if (s.symmetric) xNull else yNull)
             if (!s.filters.forall { case (xi, yi, op) => pass(xc(xi), yc(yi), op) }) Iterator.empty
             else {
               for (col <- types.indices) {

@@ -395,3 +395,41 @@ query II
 EXPLAIN SELECT a.x, b.x, COUNT(*) FROM (SELECT DISTINCT k, x FROM f) a JOIN f b ON a.k = b.k GROUP BY a.x, b.x;
 ----
 physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE fw AS SELECT k, c, x::TINYINT AS xt, x::INTEGER AS xi, (x::BIGINT - 8) * 1000003 AS xb, x::UINTEGER AS xu FROM f;
+
+statement ok
+CREATE MACRO queries27wide() AS TABLE
+  SELECT 'big_lt_int' AS q, a.xb AS i, b.xi AS j, COUNT(*)::HUGEINT AS s FROM fw a JOIN fw b ON a.k = b.k AND a.xb < b.xi GROUP BY a.xb, b.xi
+  UNION ALL SELECT 'int_ge_big', a.xi, b.xb, COUNT(*) FROM fw a JOIN fw b ON a.k = b.k AND a.xi >= b.xb GROUP BY a.xi, b.xb
+  UNION ALL SELECT 'tiny_ne_big', a.xt, b.xb, COUNT(*) FROM fw a JOIN fw b ON a.k = b.k AND a.xt <> b.xb GROUP BY a.xt, b.xb
+  UNION ALL SELECT 'uint_lt_int', a.xu, b.xi, COUNT(*) FROM fw a JOIN fw b ON a.k = b.k AND a.xu < b.xi GROUP BY a.xu, b.xi
+  UNION ALL SELECT 'tuple', a.xb, b.xi, COUNT(*) FROM fw a JOIN fw b ON a.k = b.k AND a.xb > b.xi GROUP BY a.c, a.xb, b.xi;
+
+statement ok
+CREATE TABLE with_rule27wide AS SELECT * FROM queries27wide();
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE without_rule27wide AS SELECT * FROM queries27wide();
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM with_rule27wide EXCEPT ALL SELECT * FROM without_rule27wide) UNION ALL (SELECT * FROM without_rule27wide EXCEPT ALL SELECT * FROM with_rule27wide));
+----
+0
+
+query II
+EXPLAIN SELECT a.xb, b.xi, COUNT(*) FROM fw a JOIN fw b ON a.k = b.k AND a.xb < b.xi GROUP BY a.xb, b.xi;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query II
+EXPLAIN SELECT a.xu, b.xi, COUNT(*) FROM fw a JOIN fw b ON a.k = b.k AND a.xu < b.xi GROUP BY a.xu, b.xi;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
