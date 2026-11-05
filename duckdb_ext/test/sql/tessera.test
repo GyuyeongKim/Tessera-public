@@ -149,7 +149,7 @@ CREATE TABLE nl AS SELECT i % 10 AS k, CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7
 query II
 EXPLAIN SELECT a.x, b.x, COUNT(*) FROM nl a, nl b WHERE a.k = b.k GROUP BY a.x, b.x;
 ----
-physical_plan	<!REGEX>:.*(TESSERA|Tessera).*
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
 
 statement ok
 CREATE TABLE p AS SELECT i % 10 AS k, i % 7 AS x FROM range(100) r(i);
@@ -174,7 +174,7 @@ INSERT INTO p VALUES (1, NULL);
 query II
 EXPLAIN EXECUTE pq;
 ----
-physical_plan	<!REGEX>:.*(TESSERA|Tessera).*
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
 
 query III
 EXECUTE pq;
@@ -185,3 +185,213 @@ query III
 SELECT x0, x1, round(s, 6) FROM tessera_sim('t', 'k', 'x', 'jaccard', 0.0) ORDER BY 1, 2 LIMIT 1;
 ----
 0	1	<REGEX>:0\.[0-9]+
+
+statement ok
+CREATE TABLE f AS SELECT i % 60 AS k, (i * 7) % 17 AS x, i % 3 AS k2, i % 4 AS c, (i % 5) + 1 AS v,
+  DATE '2024-01-01' + ((i * 7) % 17)::INTEGER AS dt, CAST((i % 5) * 1.25 AS DECIMAL(9, 2)) AS pr FROM range(3000) r(i);
+
+statement ok
+CREATE MACRO queries27() AS TABLE
+  SELECT 'ne' AS q, a.x::VARCHAR AS i, b.x::VARCHAR AS j, COUNT(*)::HUGEINT AS s FROM f a, f b WHERE a.k = b.k AND a.x <> b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'distinct', a.x::VARCHAR, b.x::VARCHAR, COUNT(DISTINCT a.k) FROM f a, f b WHERE a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'offset', * FROM (SELECT a.x::VARCHAR, b.x::VARCHAR, COUNT(*) AS s FROM f a, f b WHERE a.k = b.k AND a.x < b.x GROUP BY a.x, b.x ORDER BY s DESC, 1, 2 LIMIT 5 OFFSET 3)
+  UNION ALL SELECT 'one_side', a.x::VARCHAR, b.x::VARCHAR, COUNT(*) FROM f a, f b WHERE a.k = b.k AND a.c = 1 GROUP BY a.x, b.x
+  UNION ALL SELECT 'key2', a.x::VARCHAR, b.x::VARCHAR, SUM(a.v * b.v) FROM f a, f b WHERE a.k = b.k AND a.k2 = b.k2 GROUP BY a.x, b.x
+  UNION ALL SELECT 'group3', a.c || '|' || a.x, b.x::VARCHAR, COUNT(*) FROM f a, f b WHERE a.k = b.k AND a.x < b.x GROUP BY a.c, a.x, b.x
+  UNION ALL SELECT 'sum_one', a.x::VARCHAR, b.x::VARCHAR, SUM(a.v) FROM f a, f b WHERE a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'date', a.dt::VARCHAR, b.dt::VARCHAR, COUNT(*) FROM f a, f b WHERE a.k = b.k AND a.dt < b.dt GROUP BY a.dt, b.dt
+  UNION ALL SELECT 'decimal', a.x::VARCHAR, b.x::VARCHAR, CAST(SUM(a.pr * b.pr) * 10000 AS HUGEINT) FROM f a, f b WHERE a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'two', a.x::VARCHAR, b.x::VARCHAR || '|' || SUM(a.v * b.v), COUNT(*) FROM f a, f b WHERE a.k = b.k GROUP BY a.x, b.x;
+
+statement ok
+CREATE TABLE with_rule27 AS SELECT * FROM queries27();
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE without_rule27 AS SELECT * FROM queries27();
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM with_rule27 EXCEPT ALL SELECT * FROM without_rule27) UNION ALL (SELECT * FROM without_rule27 EXCEPT ALL SELECT * FROM with_rule27));
+----
+0
+
+query I
+SELECT count(DISTINCT q) FROM with_rule27;
+----
+10
+
+query II
+EXPLAIN SELECT a.x, b.x, COUNT(*) FROM f a, f b WHERE a.k = b.k AND a.x <> b.x GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query II
+EXPLAIN SELECT a.x, b.x, COUNT(*) FROM f a, f b WHERE a.k = b.k AND a.k2 = b.k2 GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query II
+EXPLAIN SELECT a.c, a.x, b.x, COUNT(*) FROM f a, f b WHERE a.k = b.k GROUP BY a.c, a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query II
+EXPLAIN SELECT a.x, b.x, COUNT(*), SUM(a.pr * b.pr) FROM f a, f b WHERE a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE MACRO queries27avg() AS TABLE
+  SELECT 'avg' AS q, a.x AS i, b.x AS j, AVG(a.v * b.v) AS s, NULL::BIGINT AS c, NULL::HUGEINT AS t FROM f a, f b
+    WHERE a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'avg_dec', a.x, b.x, AVG(a.pr * b.pr), NULL, NULL FROM f a, f b WHERE a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'avg_one', a.x, b.x, AVG(a.v), NULL, NULL FROM f a, f b WHERE a.k = b.k AND a.c = 1 GROUP BY a.x, b.x
+  UNION ALL SELECT 'avg_three', a.x, b.x, AVG(a.v * b.v), COUNT(*), SUM(a.v * b.v) FROM f a, f b WHERE a.k = b.k AND a.x < b.x
+    GROUP BY a.x, b.x;
+
+statement ok
+CREATE TABLE with_rule27avg AS SELECT * FROM queries27avg();
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE without_rule27avg AS SELECT * FROM queries27avg();
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM with_rule27avg EXCEPT ALL SELECT * FROM without_rule27avg) UNION ALL (SELECT * FROM without_rule27avg EXCEPT ALL SELECT * FROM with_rule27avg));
+----
+0
+
+query I
+SELECT count(DISTINCT q) FROM with_rule27avg;
+----
+4
+
+query II
+EXPLAIN SELECT a.x, b.x, AVG(a.v * b.v) FROM f a, f b WHERE a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query II
+EXPLAIN SELECT a.x, b.x, COUNT(*), SUM(a.pr * b.pr), AVG(a.pr * b.pr) FROM f a, f b WHERE a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE fn AS SELECT k, x, c, k2, v, CASE WHEN x % 5 = 0 THEN NULL ELSE x END AS nx FROM f;
+
+statement ok
+CREATE MACRO queries27null() AS TABLE
+  SELECT 'null' AS q, a.nx::VARCHAR AS i, b.x::VARCHAR AS j, COUNT(*)::HUGEINT AS s FROM fn a, fn b WHERE a.k = b.k
+    GROUP BY a.nx, b.x
+  UNION ALL SELECT 'null_lt', a.nx::VARCHAR, b.nx::VARCHAR, COUNT(*) FROM fn a, fn b WHERE a.k = b.k AND a.nx < b.nx
+    GROUP BY a.nx, b.nx
+  UNION ALL SELECT 'null_distinct', a.nx::VARCHAR, b.nx::VARCHAR, SUM(a.v * b.v) FROM fn a, fn b
+    WHERE a.k = b.k AND a.nx IS DISTINCT FROM b.nx GROUP BY a.nx, b.nx
+  UNION ALL SELECT 'expr_mod', (a.x % 4)::VARCHAR, b.x::VARCHAR, COUNT(*) FROM fn a, fn b WHERE a.k = b.k
+    GROUP BY a.x % 4, b.x
+  UNION ALL SELECT 'expr_concat', a.c || '-' || a.k2, (b.x // 3)::VARCHAR, COUNT(*) FROM fn a, fn b WHERE a.k = b.k
+    GROUP BY a.c || '-' || a.k2, b.x // 3;
+
+statement ok
+CREATE TABLE with_rule27null AS SELECT * FROM queries27null();
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE without_rule27null AS SELECT * FROM queries27null();
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM with_rule27null EXCEPT ALL SELECT * FROM without_rule27null) UNION ALL (SELECT * FROM without_rule27null EXCEPT ALL SELECT * FROM with_rule27null));
+----
+0
+
+query I
+SELECT count(DISTINCT q) FROM with_rule27null;
+----
+5
+
+query II
+EXPLAIN SELECT a.nx, b.x, COUNT(*) FROM fn a, fn b WHERE a.k = b.k GROUP BY a.nx, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query II
+EXPLAIN SELECT a.x % 4, b.x, COUNT(*) FROM fn a, fn b WHERE a.k = b.k GROUP BY a.x % 4, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+COPY f TO '__TEST_DIR__/f27.csv' (HEADER);
+
+statement ok
+CREATE MACRO queries27pq() AS TABLE
+  SELECT 'pq' AS q, a.x AS i, b.x AS j, COUNT(*)::HUGEINT AS s FROM read_csv('__TEST_DIR__/f27.csv') a, f b
+    WHERE a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'pq_sum', a.x, b.x, SUM(a.v * b.v) FROM read_csv('__TEST_DIR__/f27.csv') a,
+    read_csv('__TEST_DIR__/f27.csv') b WHERE a.k = b.k AND a.x < b.x GROUP BY a.x, b.x;
+
+statement ok
+CREATE TABLE with_rule27pq AS SELECT * FROM queries27pq();
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE without_rule27pq AS SELECT * FROM queries27pq();
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM with_rule27pq EXCEPT ALL SELECT * FROM without_rule27pq) UNION ALL (SELECT * FROM without_rule27pq EXCEPT ALL SELECT * FROM with_rule27pq));
+----
+0
+
+query II
+EXPLAIN SELECT a.x, b.x, COUNT(*) FROM read_csv('__TEST_DIR__/f27.csv') a, f b WHERE a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE MACRO queries27opaque() AS TABLE
+  SELECT 'distinct' AS q, a.x AS i, b.x AS j, COUNT(*)::HUGEINT AS s FROM (SELECT DISTINCT k, x FROM f) a JOIN f b
+    ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'aggregate', a.x, b.x, COUNT(*) FROM (SELECT k, x, COUNT(*) AS n FROM f GROUP BY k, x HAVING n > 1) a
+    JOIN f b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'three', a.x, c.x, COUNT(*) FROM f a JOIN f b ON a.k = b.k JOIN fn c ON b.k2 = c.k2 GROUP BY a.x, c.x;
+
+statement ok
+CREATE TABLE with_rule27opaque AS SELECT * FROM queries27opaque();
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE without_rule27opaque AS SELECT * FROM queries27opaque();
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM with_rule27opaque EXCEPT ALL SELECT * FROM without_rule27opaque) UNION ALL (SELECT * FROM without_rule27opaque EXCEPT ALL SELECT * FROM with_rule27opaque));
+----
+0
+
+query II
+EXPLAIN SELECT a.x, b.x, COUNT(*) FROM (SELECT DISTINCT k, x FROM f) a JOIN f b ON a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*

@@ -19,6 +19,8 @@ typedef struct {
   tessera_query_c *q;
   tessera_dict_c *dk, *dx, *dy;
   int eof, general, real;
+  int distinct;
+  int nk;
   int int_v;
   int any_class;
   int cross;
@@ -26,6 +28,8 @@ typedef struct {
   double min_sim;
   int64_t x0, x1, vi, rowid;
   double vd;
+  int xnull[2], xint[2], null_skip;
+  int *kkind;
 } TCur;
 
 static void free_query(TCur *c) {
@@ -33,8 +37,10 @@ static void free_query(TCur *c) {
   if (c->dk) tessera_dict_free(c->dk);
   if (c->dx) tessera_dict_free(c->dx);
   if (c->dy) tessera_dict_free(c->dy);
+  sqlite3_free(c->kkind);
   c->q = 0;
   c->dk = c->dx = c->dy = 0;
+  c->kkind = 0;
 }
 
 static int host_is_interrupted;
@@ -157,26 +163,195 @@ static int tNext(sqlite3_vtab_cursor *cur) {
 
 #define LOAD_REAL 1000
 
-static int load_rows(TCur *c, sqlite3 *db, const char *fn, const char *tbl, const char *kc, const char *xc, const char *vc,
-                     int side, int *kkind, int *xkind) {
-  const char *cols[2] = {kc, xc};
-  int text_ok[2];
-  for (int i = 0; i < 2; i++) {
-    const char *coll = 0;
-    text_ok[i] = sqlite3_table_column_metadata != 0 &&
-                 sqlite3_table_column_metadata(db, 0, tbl, cols[i], 0, &coll, 0, 0, 0) == SQLITE_OK;
-    if (text_ok[i] && coll && sqlite3_stricmp(coll, "BINARY") != 0) {
-      char msg[200];
-      snprintf(msg, sizeof msg, "%s: column %s has collation %s; only BINARY is supported", fn, cols[i], coll);
-      return fail(c, msg);
+static void free_names(char **v, int n) {
+  if (!v) return;
+  for (int i = 0; i < n; i++) sqlite3_free(v[i]);
+  sqlite3_free(v);
+}
+
+static int key_columns(sqlite3 *db, const char *tbl, const char *kc, char ***names) {
+  const int one = !strchr(kc, ',') || (sqlite3_table_column_metadata != 0 &&
+                                       sqlite3_table_column_metadata(db, 0, tbl, kc, 0, 0, 0, 0, 0) == SQLITE_OK);
+  int n = 1;
+  if (!one)
+    for (const char *p = kc; *p; p++) n += *p == ',';
+  char **v = sqlite3_malloc64(sizeof(char *) * (sqlite3_uint64)n);
+  *names = v;
+  if (!v) return -2;
+  memset(v, 0, sizeof(char *) * (size_t)n);
+  int r = n;
+  if (one) {
+    if (!(v[0] = sqlite3_mprintf("%s", kc))) r = -2;
+  } else {
+    const char *p = kc;
+    for (int i = 0; i < n && r > 0; i++) {
+      while (*p == ' ') p++;
+      const char *e = strchr(p, ',');
+      size_t len = e ? (size_t)(e - p) : strlen(p);
+      while (len > 0 && p[len - 1] == ' ') len--;
+      if (len == 0 || len > 0x7fffffff) r = -1;
+      else if (!(v[i] = sqlite3_mprintf("%.*s", (int)len, p))) r = -2;
+      p = e ? e + 1 : p + len;
     }
   }
-  char *sql = vc ? sqlite3_mprintf("SELECT \"%w\", \"%w\", \"%w\" FROM \"%w\"", kc, xc, vc, tbl)
-                 : sqlite3_mprintf("SELECT \"%w\", \"%w\" FROM \"%w\"", kc, xc, tbl);
+  if (r < 0) {
+    free_names(v, n);
+    *names = 0;
+  }
+  return r;
+}
+
+static int tuple_key(sqlite3_stmt *st, int nk, int *kind, tessera_dict_c **d, int64_t *out, const int *text_ok,
+                     char **buf, size_t *cap) {
+  size_t len = 0;
+  for (int i = 0; i < nk; i++) {
+    const int t = sqlite3_column_type(st, i);
+    const int k = t == SQLITE_INTEGER ? 1 : t == SQLITE_TEXT ? 2 : 0;
+    if (!k || (kind[i] && kind[i] != k)) return 1;
+    if (k == 2 && !text_ok[i]) return 5;
+    kind[i] = k;
+    const size_t need = k == 1 ? 8 : 4 + (size_t)sqlite3_column_bytes(st, i);
+    if (len + need > *cap) {
+      size_t c = *cap ? *cap : 256;
+      while (c < len + need) c *= 2;
+      char *b = realloc(*buf, c);
+      if (!b) return 2;
+      *buf = b;
+      *cap = c;
+    }
+    if (k == 1) {
+      const int64_t v = sqlite3_column_int64(st, i);
+      memcpy(*buf + len, &v, 8);
+      len += 8;
+    } else {
+      const unsigned char *s = sqlite3_column_text(st, i);
+      const uint32_t n = (uint32_t)sqlite3_column_bytes(st, i);
+      memcpy(*buf + len, &n, 4);
+      memcpy(*buf + len + 4, s, n);
+      len += 4 + n;
+    }
+  }
+  if (!*d && !(*d = tessera_dict_new())) return 2;
+  *out = tessera_dict_code(*d, *buf, len);
+  return *out < 0 ? 2 : 0;
+}
+
+static int may_hold_null(sqlite3 *db, const char *tbl, const char *col) {
+  int notnull = 0;
+  if (sqlite3_table_column_metadata != 0 &&
+      sqlite3_table_column_metadata(db, 0, tbl, col, 0, 0, &notnull, 0, 0) == SQLITE_OK && notnull)
+    return 0;
+  char *sql = sqlite3_mprintf("SELECT 1 FROM \"%w\" WHERE \"%w\" IS NULL LIMIT 1", tbl, col);
+  if (!sql) return 1;
   sqlite3_stmt *st = 0;
-  int rc = sqlite3_prepare_v2(db, sql, -1, &st, 0);
+  int found = 1;
+  if (sqlite3_prepare_v2(db, sql, -1, &st, 0) == SQLITE_OK) found = sqlite3_step(st) != SQLITE_DONE;
+  sqlite3_finalize(st);
   sqlite3_free(sql);
-  if (rc != SQLITE_OK) return fail_rc(c, sqlite3_errmsg(db), rc);
+  return found;
+}
+
+static int null_group_code(sqlite3_stmt *st, int i, int *kind, tessera_dict_c **d, int64_t *out, int text_ok,
+                           char **buf, size_t *cap) {
+  const int t = sqlite3_column_type(st, i);
+  if (!*d && !(*d = tessera_dict_new())) return 2;
+  if (t == SQLITE_NULL) {
+    *out = tessera_dict_code(*d, "", 1);
+    return *out < 0 ? 2 : 0;
+  }
+  const int k = t == SQLITE_INTEGER ? 1 : t == SQLITE_TEXT ? 2 : 0;
+  if (!k || (*kind && *kind != k)) return 1;
+  if (k == 2 && !text_ok) return 5;
+  *kind = k;
+  const size_t len = k == 1 ? sizeof(int64_t) : (size_t)sqlite3_column_bytes(st, i);
+  if (len + 1 > *cap) {
+    char *nb = realloc(*buf, len + 1);
+    if (!nb) return 2;
+    *buf = nb;
+    *cap = len + 1;
+  }
+  (*buf)[0] = 1;
+  if (k == 1) {
+    const int64_t v = sqlite3_column_int64(st, i);
+    memcpy(*buf + 1, &v, sizeof v);
+  } else {
+    memcpy(*buf + 1, sqlite3_column_text(st, i), len);
+  }
+  *out = tessera_dict_code(*d, *buf, len + 1);
+  return *out < 0 ? 2 : 0;
+}
+
+static int load_rows(TCur *c, sqlite3 *db, const char *fn, const char *tbl, const char *kc, const char *xc, const char *vc,
+                     int side, int *xkind) {
+  char **kn = 0;
+  const int nk = key_columns(db, tbl, kc, &kn);
+  char msg[300];
+  if (nk < 0) {
+    if (nk == -2) return fail_rc(c, "tessera: out of memory", SQLITE_NOMEM);
+    snprintf(msg, sizeof msg, "%s: the key columns are names separated by commas", fn);
+    return fail(c, msg);
+  }
+  if (side == 0) {
+    c->nk = nk;
+    sqlite3_free(c->kkind);
+    if (!(c->kkind = sqlite3_malloc64(sizeof(int) * (sqlite3_uint64)nk))) {
+      free_names(kn, nk);
+      return fail_rc(c, "tessera: out of memory", SQLITE_NOMEM);
+    }
+    memset(c->kkind, 0, sizeof(int) * (size_t)nk);
+  } else if (nk != c->nk) {
+    free_names(kn, nk);
+    snprintf(msg, sizeof msg, "%s: the two key column lists have different lengths", fn);
+    return fail(c, msg);
+  }
+  int *kkind = c->kkind;
+  const char **cols = sqlite3_malloc64(sizeof(char *) * (sqlite3_uint64)(nk + 1));
+  int *text_ok = sqlite3_malloc64(sizeof(int) * (sqlite3_uint64)(nk + 1));
+  char *sql = 0;
+  int rc = SQLITE_OK;
+  if (cols && text_ok) {
+    for (int i = 0; i < nk; i++) cols[i] = kn[i];
+    cols[nk] = xc;
+    for (int i = 0; i <= nk && rc == SQLITE_OK; i++) {
+      const char *coll = 0;
+      text_ok[i] = sqlite3_table_column_metadata != 0 &&
+                   sqlite3_table_column_metadata(db, 0, tbl, cols[i], 0, &coll, 0, 0, 0) == SQLITE_OK;
+      if (text_ok[i] && coll && sqlite3_stricmp(coll, "BINARY") != 0) {
+        snprintf(msg, sizeof msg, "%s: column %s has collation %s; only BINARY is supported", fn, cols[i], coll);
+        rc = SQLITE_ERROR;
+      }
+    }
+    sql = rc == SQLITE_OK ? sqlite3_mprintf("SELECT ") : 0;
+    for (int i = 0; sql && rc == SQLITE_OK && i <= nk + (vc ? 1 : 0); i++) {
+      char *n2 = sqlite3_mprintf("%s%s\"%w\"", sql, i ? ", " : "", i <= nk ? cols[i] : vc);
+      sqlite3_free(sql);
+      sql = n2;
+    }
+    if (sql && rc == SQLITE_OK) {
+      char *n2 = sqlite3_mprintf("%s FROM \"%w\"", sql, tbl);
+      sqlite3_free(sql);
+      sql = n2;
+    }
+  }
+  if (rc != SQLITE_OK || !sql) {
+    sqlite3_free(sql);
+    sqlite3_free(cols);
+    sqlite3_free(text_ok);
+    free_names(kn, nk);
+    return rc != SQLITE_OK ? fail(c, msg) : fail_rc(c, "tessera: out of memory", SQLITE_NOMEM);
+  }
+  sqlite3_stmt *st = 0;
+  rc = sqlite3_prepare_v2(db, sql, -1, &st, 0);
+  sqlite3_free(sql);
+  if (rc != SQLITE_OK) {
+    sqlite3_free(cols);
+    sqlite3_free(text_ok);
+    free_names(kn, nk);
+    return fail_rc(c, sqlite3_errmsg(db), rc);
+  }
+  const int xi = nk, vi = nk + 1;
+  char *tbuf = 0;
+  size_t tcap = 0;
   enum { BATCH = 65536 };
   int64_t *kb = malloc(sizeof(int64_t) * BATCH), *xb = malloc(sizeof(int64_t) * BATCH);
   const int iv = vc && c->int_v;
@@ -189,19 +364,26 @@ static int load_rows(TCur *c, sqlite3 *db, const char *fn, const char *tbl, cons
   (iv ? (side ? tessera_c_add_y_i64(c->q, kb, xb, vib, n) : tessera_c_add_i64(c->q, kb, xb, vib, n)) \
       : (side ? tessera_c_add_y(c->q, kb, xb, vb, n) : tessera_c_add(c->q, kb, xb, vb, n)))
   while (!bad && (rc = sqlite3_step(st)) == SQLITE_ROW) {
-    if (sqlite3_column_type(st, 0) == SQLITE_NULL) continue;
-    if (sqlite3_column_type(st, 1) == SQLITE_NULL || (vc && sqlite3_column_type(st, 2) == SQLITE_NULL)) { bad = 1; break; }
-    const int e = key_of(st, 0, kkind, &c->dk, &kb[n], text_ok[0]);
-    const int f = e ? e : key_of(st, 1, xkind, dxs, &xb[n], text_ok[1]);
+    int null_key = 0;
+    for (int i = 0; i < nk; i++) null_key |= sqlite3_column_type(st, i) == SQLITE_NULL;
+    if (null_key) continue;
+    if (sqlite3_column_type(st, xi) == SQLITE_NULL && c->null_skip) continue;
+    if (sqlite3_column_type(st, xi) == SQLITE_NULL && !c->xnull[side]) { bad = 1; break; }
+    if (vc && sqlite3_column_type(st, vi) == SQLITE_NULL) { bad = 9; break; }
+    const int e = nk == 1 ? key_of(st, 0, &kkind[0], &c->dk, &kb[n], text_ok[0])
+                          : tuple_key(st, nk, kkind, &c->dk, &kb[n], text_ok, &tbuf, &tcap);
+    const int f = e ? e
+                : c->xnull[side] ? null_group_code(st, xi, xkind, dxs, &xb[n], text_ok[nk], &tbuf, &tcap)
+                                 : key_of(st, xi, xkind, dxs, &xb[n], text_ok[nk]);
     if (e || f) { const int g = e ? e : f; bad = g == 2 ? 2 : g == 5 ? (e ? 5 : 6) : 3; break; }
-    const int vt = vc ? sqlite3_column_type(st, 2) : 0;
+    const int vt = vc ? sqlite3_column_type(st, vi) : 0;
     if (vc && vt != SQLITE_INTEGER && vt != SQLITE_FLOAT) { bad = 7; break; }
     if (iv) {
       if (vt != SQLITE_INTEGER) { bad = 4; break; }
-      vib[n] = sqlite3_column_int64(st, 2);
+      vib[n] = sqlite3_column_int64(st, vi);
     } else if (vc) {
       if (vt == SQLITE_INTEGER && !c->any_class) { bad = 8; break; }
-      vb[n] = sqlite3_column_double(st, 2);
+      vb[n] = sqlite3_column_double(st, vi);
       if (vt == SQLITE_FLOAT) c->real = 1;
     }
     if (++n == BATCH) {
@@ -216,9 +398,14 @@ static int load_rows(TCur *c, sqlite3 *db, const char *fn, const char *tbl, cons
   free(xb);
   free(vb);
   free(vib);
+  free(tbuf);
+  sqlite3_free(cols);
+  sqlite3_free(text_ok);
+  free_names(kn, nk);
   if (bad == 4) return LOAD_REAL;
-  char msg[300];
-  if (bad == 1) { snprintf(msg, sizeof msg, "%s: NULL group keys or values are not supported", fn); return fail(c, msg); }
+  if (bad == 1) { snprintf(msg, sizeof msg, "%s: NULL group keys are not supported here", fn); return fail(c, msg); }
+  if (bad == 9) { snprintf(msg, sizeof msg, "%s: NULL values are not supported", fn); return fail(c, msg); }
+  c->xint[side] = *xkind != 2;
   if (bad == 2) { snprintf(msg, sizeof msg, "%s: out of memory", fn); return fail_rc(c, msg, SQLITE_NOMEM); }
   if (bad == 3) { snprintf(msg, sizeof msg, "%s: keys must be all INTEGER or all TEXT per column", fn); return fail(c, msg); }
   if (bad == 5 || bad == 6) {
@@ -241,6 +428,7 @@ static int load_rows(TCur *c, sqlite3 *db, const char *fn, const char *tbl, cons
 
 static int run_query_c(TCur *c, sqlite3 *db, int mode, int64_t minval, int threads) {
   if (c->sim_measure) tessera_c_set_similarity(c->q, c->sim_measure, c->min_sim);
+  tessera_c_set_distinct_keys(c->q, c->distinct);
   if (c->dx) tessera_c_set_xdict(c->q, c->dx);
   if (c->dy) tessera_c_set_ydict(c->q, c->dy);
   const sqlite3_int64 limit = sqlite3_soft_heap_limit64(-1);
@@ -278,12 +466,19 @@ static int tFilter(sqlite3_vtab_cursor *cur, int mask, const char *idxStr, int a
   if (!tessera_c_supported()) return fail(c, "tessera_xtx: this CPU lacks x86-64-v3 (AVX2, BMI2, FMA), which Tessera needs");
   if (!arg[C_TBL] || !arg[C_K] || !arg[C_X]) return fail(c, "tessera_xtx: the table, k and x arguments must not be NULL");
   const int has_v = val[C_V] && sqlite3_value_type(val[C_V]) != SQLITE_NULL;
-  int mode = 0;
+  int mode = 0, distinct = 0;
   if (arg[C_MODE]) {
-    if (strcmp(arg[C_MODE], "lt") == 0) mode = 1;
-    else if (strcmp(arg[C_MODE], "le") == 0) mode = 2;
-    else if (strcmp(arg[C_MODE], "full") != 0) return fail(c, "tessera_xtx: mode is 'full', 'lt' or 'le'");
+    const char *m = arg[C_MODE], *sp = strchr(m, ' ');
+    const size_t n = sp ? (size_t)(sp - m) : strlen(m);
+    if (n == 2 && strncmp(m, "lt", 2) == 0) mode = 1;
+    else if (n == 2 && strncmp(m, "le", 2) == 0) mode = 2;
+    else if (n == 2 && strncmp(m, "ne", 2) == 0) mode = 3;
+    else if (!(n == 4 && strncmp(m, "full", 4) == 0)) mode = -1;
+    if (sp && strcmp(sp, " distinct") == 0) distinct = 1;
+    else if (sp) mode = -1;
+    if (mode < 0) return fail(c, "tessera_xtx: mode is 'full', 'lt', 'le' or 'ne', optionally followed by ' distinct'");
   }
+  if (distinct && has_v) return fail(c, "tessera_xtx: mode '... distinct' counts keys, without a v column");
   const int64_t minval = val[C_MIN] && sqlite3_value_type(val[C_MIN]) != SQLITE_NULL ? sqlite3_value_int64(val[C_MIN]) : 0;
   const int threads = val[C_THREADS] && sqlite3_value_type(val[C_THREADS]) != SQLITE_NULL ? sqlite3_value_int(val[C_THREADS]) : 0;
   for (int int_v = has_v;; int_v = 0) {
@@ -294,12 +489,16 @@ static int tFilter(sqlite3_vtab_cursor *cur, int mask, const char *idxStr, int a
     c->cross = 0;
     c->sim_measure = 0;
     c->any_class = 0;
+    c->distinct = distinct;
+    c->null_skip = mode != 0;
+    c->xnull[0] = mode == 0 && may_hold_null(db, arg[C_TBL], arg[C_X]);
+    c->xnull[1] = 0;
     if (!c->q) return fail_rc(c, "tessera_xtx: out of memory", SQLITE_NOMEM);
-    int kkind = 0, xkind = 0;
-    const int r = load_rows(c, db, "tessera_xtx", arg[C_TBL], arg[C_K], arg[C_X], has_v ? arg[C_V] : 0, 0, &kkind, &xkind);
+    int xkind = 0;
+    const int r = load_rows(c, db, "tessera_xtx", arg[C_TBL], arg[C_K], arg[C_X], has_v ? arg[C_V] : 0, 0, &xkind);
     if (r == LOAD_REAL) continue;
     if (r) return r;
-    if (mode && xkind == 2 && !db_utf8(db))
+    if ((mode == 1 || mode == 2) && xkind == 2 && !db_utf8(db))
       return fail(c, "tessera_xtx: mode 'lt' or 'le' on TEXT group keys needs a UTF-8 database (BINARY orders UTF-16 "
                      "text by its UTF-16 bytes)");
     break;
@@ -315,10 +514,17 @@ static int tColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx, int col) {
     case C_X0:
     case C_X1: {
       const int64_t x = col == C_X0 ? c->x0 : c->x1;
+      const int side = c->cross && col == C_X1;
       size_t len;
-      const char *s = c->cross && col == C_X1 ? (c->dy ? tessera_c_ystr(c->q, x, &len) : 0)
-                                              : (c->dx ? tessera_c_xstr(c->q, x, &len) : 0);
-      if (s) sqlite3_result_text(ctx, s, (int)len, SQLITE_TRANSIENT);
+      const char *s = side ? (c->dy ? tessera_c_ystr(c->q, x, &len) : 0) : (c->dx ? tessera_c_xstr(c->q, x, &len) : 0);
+      if (s && c->xnull[side]) {
+        int64_t v;
+        if (s[0] == 0) sqlite3_result_null(ctx);
+        else if (c->xint[side] && len == 1 + sizeof v) {
+          memcpy(&v, s + 1, sizeof v);
+          sqlite3_result_int64(ctx, v);
+        } else sqlite3_result_text(ctx, s + 1, (int)len - 1, SQLITE_TRANSIENT);
+      } else if (s) sqlite3_result_text(ctx, s, (int)len, SQLITE_TRANSIENT);
       else sqlite3_result_int64(ctx, x);
       break;
     }
@@ -402,10 +608,13 @@ static int yFilter(sqlite3_vtab_cursor *cur, int mask, const char *idxStr, int a
     c->cross = 1;
     c->sim_measure = 0;
     c->any_class = 0;
+    c->null_skip = 0;
+    c->xnull[0] = may_hold_null(db, arg[Y_T1], arg[Y_X1]);
+    c->xnull[1] = may_hold_null(db, arg[Y_T2], arg[Y_Y2]);
     if (!c->q) return fail_rc(c, "tessera_xty: out of memory", SQLITE_NOMEM);
-    int kkind = 0, xkind = 0, ykind = 0;
-    int r = load_rows(c, db, "tessera_xty", arg[Y_T1], arg[Y_K1], arg[Y_X1], has_v ? arg[Y_V1] : 0, 0, &kkind, &xkind);
-    if (!r) r = load_rows(c, db, "tessera_xty", arg[Y_T2], arg[Y_K2], arg[Y_Y2], has_v ? arg[Y_V2] : 0, 1, &kkind, &ykind);
+    int xkind = 0, ykind = 0;
+    int r = load_rows(c, db, "tessera_xty", arg[Y_T1], arg[Y_K1], arg[Y_X1], has_v ? arg[Y_V1] : 0, 0, &xkind);
+    if (!r) r = load_rows(c, db, "tessera_xty", arg[Y_T2], arg[Y_K2], arg[Y_Y2], has_v ? arg[Y_V2] : 0, 1, &ykind);
     if (r == LOAD_REAL) continue;
     if (r) return r;
     break;
@@ -472,7 +681,8 @@ static int sFilter(sqlite3_vtab_cursor *cur, int mask, const char *idxStr, int a
   if (arg[S_MODE]) {
     if (strcmp(arg[S_MODE], "full") == 0) mode = 0;
     else if (strcmp(arg[S_MODE], "le") == 0) mode = 2;
-    else if (strcmp(arg[S_MODE], "lt") != 0) return fail(c, "tessera_sim: mode is 'lt', 'le' or 'full'");
+    else if (strcmp(arg[S_MODE], "ne") == 0) mode = 3;
+    else if (strcmp(arg[S_MODE], "lt") != 0) return fail(c, "tessera_sim: mode is 'lt', 'le', 'full' or 'ne'");
   }
   const int has_v = val[S_V] && sqlite3_value_type(val[S_V]) != SQLITE_NULL;
   const int threads = val[S_THREADS] && sqlite3_value_type(val[S_THREADS]) != SQLITE_NULL ? sqlite3_value_int(val[S_THREADS]) : 0;
@@ -485,10 +695,12 @@ static int sFilter(sqlite3_vtab_cursor *cur, int mask, const char *idxStr, int a
   c->any_class = 1;
   c->min_sim = sqlite3_value_double(val[S_T]);
   if (!c->q) return fail_rc(c, "tessera_sim: out of memory", SQLITE_NOMEM);
-  int kkind = 0, xkind = 0;
-  const int r = load_rows(c, db, "tessera_sim", arg[S_TBL], arg[S_K], arg[S_X], has_v ? arg[S_V] : 0, 0, &kkind, &xkind);
+  c->null_skip = 1;
+  c->xnull[0] = c->xnull[1] = 0;
+  int xkind = 0;
+  const int r = load_rows(c, db, "tessera_sim", arg[S_TBL], arg[S_K], arg[S_X], has_v ? arg[S_V] : 0, 0, &xkind);
   if (r) return r;
-  if (mode && xkind == 2 && !db_utf8(db))
+  if ((mode == 1 || mode == 2) && xkind == 2 && !db_utf8(db))
     return fail(c, "tessera_sim: mode 'lt' or 'le' on TEXT items needs a UTF-8 database (BINARY orders UTF-16 text by "
                    "its UTF-16 bytes)");
   return run_query_c(c, db, mode, 0, threads);

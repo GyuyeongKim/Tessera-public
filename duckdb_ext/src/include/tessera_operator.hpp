@@ -1,5 +1,6 @@
 #pragma once
 
+#include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -10,12 +11,14 @@ namespace duckdb {
 enum class TesseraPairMode : uint8_t {
 	FULL,
 	LT,
-	LE
+	LE,
+	NE
 };
 
 struct TesseraPlanInfo {
 	ColumnBinding k_bind, x_bind, v_bind;
 	bool has_value = false;
+	bool distinct_keys = false;
 	bool distinct_only = false;
 	bool eager = false;
 	idx_t k_pos = 0, x_pos = 0, v_pos = DConstants::INVALID_INDEX;
@@ -26,6 +29,40 @@ struct TesseraPlanInfo {
 	shared_ptr<Expression> x_compress[2];
 	bool cross = false, y_str = false;
 	LogicalType y_type;
+	struct TupleCol {
+		LogicalType type;
+		bool str = false;
+		bool nullable = false;
+		int64_t off = 0;
+		shared_ptr<Expression> compress;
+	};
+	struct PairFilter {
+		idx_t xi, yi;
+		ExpressionType op;
+	};
+	bool general_cross = false;
+	idx_t nk = 1;
+	vector<bool> k_strs;
+	vector<TupleCol> xcols, ycols;
+	vector<std::pair<uint8_t, idx_t>> out_groups;
+	vector<PairFilter> filters;
+	bool two = false, count_first = true;
+	LogicalType agg2_type;
+	vector<uint8_t> aggs;
+	LogicalType avg_input;
+	bool symmetric = false;
+	bool KDict() const {
+		return nk > 1 || k_str;
+	}
+	bool XDict() const {
+		return general_cross ? xcols.size() > 1 || xcols[0].str || xcols[0].nullable : x_str;
+	}
+	bool YDict() const {
+		return general_cross ? ycols.size() > 1 || ycols[0].str || ycols[0].nullable : y_str;
+	}
+	static bool Tuples(const vector<TupleCol> &cols) {
+		return cols.size() > 1 || cols[0].nullable;
+	}
 	uint64_t min_value = 0;
 	int64_t topk = -1;
 	int sim_measure = 0;

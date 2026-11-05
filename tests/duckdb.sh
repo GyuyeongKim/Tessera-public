@@ -9,7 +9,8 @@ DB=$W/test.duckdb
 SELECT setseed(0.42);
 CREATE TABLE r AS
   SELECT k, x, v, 'k' || k AS ks, 'item-' || x AS xs,
-         k::BIGINT * 1000000007 - 4000000000000000000 AS kw, x::BIGINT * 999999937 + 3000000000000000000 AS xw
+         k::BIGINT * 1000000007 - 4000000000000000000 AS kw, x::BIGINT * 999999937 + 3000000000000000000 AS xw,
+         CASE WHEN x % 10 = 0 THEN NULL ELSE x END AS xn
   FROM (SELECT (random() * 2000)::INTEGER AS k, floor(power(random(), 3) * 600)::INTEGER AS x,
                (1 + floor(random() * 5))::DOUBLE AS v
         FROM range(60000)) g;
@@ -62,6 +63,22 @@ check frontier_le_sum "SET tessera_frontier = 512;" \
 check join_count "" "SELECT a.x AS i, b.x AS j, COUNT(*) AS s FROM r a JOIN r b ON a.k = b.k GROUP BY a.x, b.x"
 check cross_count "" "SELECT a.x AS i, b.y AS j, COUNT(*) AS s FROM r a, s b WHERE a.k = b.k GROUP BY a.x, b.y"
 check cross_sum "" "SELECT a.x AS i, b.y AS j, SUM(a.v * b.w) AS s FROM r a, s b WHERE a.k = b.k GROUP BY a.x, b.y"
+check ne "" "SELECT a.x AS i, b.x AS j, COUNT(*) AS s $SELF AND a.x <> b.x GROUP BY a.x, b.x"
+check avg "" "SELECT a.x AS i, b.x AS j, AVG(a.v * b.v) AS s $SELF GROUP BY a.x, b.x" "count(*), sum(hash(i, j, s))"
+check three_aggs "" "SELECT a.x AS i, b.y AS j, COUNT(*) AS s, SUM(a.v * b.w) AS t, AVG(a.v * b.w) AS m
+  FROM r a, s b WHERE a.k = b.k GROUP BY a.x, b.y" "count(*), sum(s)::HUGEINT, sum(hash(i, j, s, t, m))"
+check count_distinct "" "SELECT a.x AS i, b.x AS j, COUNT(DISTINCT a.k) AS s $SELF AND a.x < b.x GROUP BY a.x, b.x"
+check key_two_columns "" "SELECT a.x AS i, b.x AS j, COUNT(*) AS s FROM r a, r b WHERE a.k = b.k AND a.x % 4 = b.x % 4
+  GROUP BY a.x, b.x"
+check key_computed "" "SELECT a.x AS i, b.y AS j, COUNT(*) AS s FROM r a, s b WHERE a.k % 500 = b.k % 500 GROUP BY a.x, b.y"
+check group_computed "" "SELECT a.x % 10 AS i, b.x AS j, COUNT(*) AS s $SELF GROUP BY a.x % 10, b.x"
+check group_three "" "SELECT a.x % 3 || '-' || a.x AS i, b.y AS j, COUNT(*) AS s FROM r a, s b WHERE a.k = b.k
+  GROUP BY a.x % 3, a.x, b.y"
+check null_groups "" "SELECT a.xn AS i, b.xn AS j, COUNT(*) AS s $SELF GROUP BY a.xn, b.xn"
+check null_distinct_from "" "SELECT a.xn AS i, b.xn AS j, COUNT(*) AS s $SELF AND a.xn IS DISTINCT FROM b.xn
+  GROUP BY a.xn, b.xn"
+check filters "" "SELECT a.x AS i, b.y AS j, SUM(a.v * b.w) AS s FROM r a, s b WHERE a.k = b.k AND a.v > 2 AND b.w < 3
+  GROUP BY a.x, b.y"
 
 sim() {
   local name=$1 measure=$2 t=$3 formula=$4

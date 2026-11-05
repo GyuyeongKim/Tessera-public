@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <map>
+#include <mutex>
 #include <new>
 #include <string>
 #include <vector>
@@ -27,9 +29,9 @@ void throw_state(JNIEnv *env, const char *what) {
 
 struct Pinned {
   JNIEnv *env;
-  jarray arr[4];
-  void *ptr[4];
-  int mode[4];
+  jarray arr[6];
+  void *ptr[6];
+  int mode[6];
   int n = 0;
   bool good = true;
   explicit Pinned(JNIEnv *e) : env(e) {}
@@ -242,6 +244,10 @@ JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setSimilarity(JNIEnv *, 
   tessera_c_set_similarity((tessera_query_c *)h, measure, min_sim);
 }
 
+JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setDistinctKeys(JNIEnv *, jclass, jlong h, jboolean on) {
+  tessera_c_set_distinct_keys((tessera_query_c *)h, on ? 1 : 0);
+}
+
 JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_cancel(JNIEnv *, jclass, jlong h) {
   tessera_c_cancel((tessera_query_c *)h);
 }
@@ -267,12 +273,134 @@ JNIEXPORT jint JNICALL Java_tessera_spark_TesseraNative_next(JNIEnv *env, jclass
   return (jint)n;
 }
 
+JNIEXPORT jint JNICALL Java_tessera_spark_TesseraNative_next2(JNIEnv *env, jclass, jlong h, jlongArray x0,
+                                                              jlongArray x1, jlongArray cnt, jlongArray vi,
+                                                              jdoubleArray vd) {
+  const jsize cap = env->GetArrayLength(x0);
+  size_t n = 0;
+  {
+    Pinned p(env);
+    jlong *a = (jlong *)p.pin(x0, 0), *b = (jlong *)p.pin(x1, 0), *c = (jlong *)p.pin(cnt, 0), *l = (jlong *)p.pin(vi, 0);
+    jdouble *d = (jdouble *)p.pin(vd, 0);
+    if (!p.ok()) {
+      n = (size_t)-1;
+    } else {
+      n = tessera_c_next_batch2((tessera_query_c *)h, (int64_t *)a, (int64_t *)b, (int64_t *)c, nullptr, (uint64_t *)l,
+                                (double *)d, (size_t)cap);
+    }
+  }
+  if (n == (size_t)-1) {
+    throw_oom(env, "tessera: cannot pin the output arrays");
+    return 0;
+  }
+  return (jint)n;
+}
+
+JNIEXPORT jint JNICALL Java_tessera_spark_TesseraNative_next128(JNIEnv *env, jclass, jlong h, jlongArray x0,
+                                                                jlongArray x1, jlongArray hi, jlongArray lo) {
+  const jsize cap = env->GetArrayLength(x0);
+  size_t n = 0;
+  {
+    Pinned p(env);
+    jlong *a = (jlong *)p.pin(x0, 0), *b = (jlong *)p.pin(x1, 0), *u = (jlong *)p.pin(hi, 0), *l = (jlong *)p.pin(lo, 0);
+    if (!p.ok()) {
+      n = (size_t)-1;
+    } else {
+      n = tessera_c_next_batch128((tessera_query_c *)h, (int64_t *)a, (int64_t *)b, (int64_t *)u, (uint64_t *)l,
+                                  (size_t)cap);
+    }
+  }
+  if (n == (size_t)-1) {
+    throw_oom(env, "tessera: cannot pin the output arrays");
+    return 0;
+  }
+  return (jint)n;
+}
+
+JNIEXPORT jint JNICALL Java_tessera_spark_TesseraNative_next2Wide(JNIEnv *env, jclass, jlong h, jlongArray x0,
+                                                                  jlongArray x1, jlongArray cnt, jlongArray hi,
+                                                                  jlongArray lo, jdoubleArray vd) {
+  const jsize cap = env->GetArrayLength(x0);
+  size_t n = 0;
+  {
+    Pinned p(env);
+    jlong *a = (jlong *)p.pin(x0, 0), *b = (jlong *)p.pin(x1, 0), *c = (jlong *)p.pin(cnt, 0), *u = (jlong *)p.pin(hi, 0);
+    jlong *l = (jlong *)p.pin(lo, 0);
+    jdouble *d = (jdouble *)p.pin(vd, 0);
+    if (!p.ok()) {
+      n = (size_t)-1;
+    } else {
+      n = tessera_c_next_batch2((tessera_query_c *)h, (int64_t *)a, (int64_t *)b, (int64_t *)c, (int64_t *)u,
+                                (uint64_t *)l, (double *)d, (size_t)cap);
+    }
+  }
+  if (n == (size_t)-1) {
+    throw_oom(env, "tessera: cannot pin the output arrays");
+    return 0;
+  }
+  return (jint)n;
+}
+
+JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setTwo(JNIEnv *, jclass, jlong h, jboolean on) {
+  tessera_c_set_two((tessera_query_c *)h, on ? 1 : 0);
+}
+
 JNIEXPORT jboolean JNICALL Java_tessera_spark_TesseraNative_general(JNIEnv *, jclass, jlong h) {
   return tessera_c_general((const tessera_query_c *)h) ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_free(JNIEnv *, jclass, jlong h) {
+struct PairFilterRef {
+  JavaVM *vm;
+  jobject obj;
+  jmethodID mid;
+};
+static std::mutex pair_mu;
+static std::map<jlong, PairFilterRef *> pair_refs;
+
+static int pair_pass_jni(void *ctx, int64_t a, int64_t b) {
+  PairFilterRef *p = static_cast<PairFilterRef *>(ctx);
+  JNIEnv *env = nullptr;
+  if (p->vm->GetEnv((void **)&env, JNI_VERSION_1_8) != JNI_OK) return 1;
+  const jboolean r = env->CallBooleanMethod(p->obj, p->mid, (jlong)a, (jlong)b);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return 1;
+  }
+  return r ? 1 : 0;
+}
+
+JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setPairFilter(JNIEnv *env, jclass, jlong h, jobject filter,
+                                                                      jint product_bits) {
+  jclass c = env->GetObjectClass(filter);
+  jmethodID mid = c ? env->GetMethodID(c, "pass", "(JJ)Z") : nullptr;
+  PairFilterRef *p = mid ? new (std::nothrow) PairFilterRef() : nullptr;
+  if (!p || env->GetJavaVM(&p->vm) != JNI_OK || !(p->obj = env->NewGlobalRef(filter))) {
+    delete p;
+    if (!env->ExceptionCheck()) throw_oom(env, "tessera: cannot keep the pair filter");
+    return;
+  }
+  p->mid = mid;
+  {
+    std::lock_guard<std::mutex> g(pair_mu);
+    PairFilterRef *&slot = pair_refs[h];
+    if (slot) {
+      env->DeleteGlobalRef(slot->obj);
+      delete slot;
+    }
+    slot = p;
+  }
+  tessera_c_set_pair_filter((tessera_query_c *)h, pair_pass_jni, p, product_bits);
+}
+
+JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_free(JNIEnv *env, jclass, jlong h) {
   tessera_c_free((tessera_query_c *)h);
+  std::lock_guard<std::mutex> g(pair_mu);
+  auto it = pair_refs.find(h);
+  if (it != pair_refs.end()) {
+    env->DeleteGlobalRef(it->second->obj);
+    delete it->second;
+    pair_refs.erase(it);
+  }
 }
 
 }

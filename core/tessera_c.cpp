@@ -31,6 +31,11 @@ struct tessera_query_c {
   bool keep_threads = false;
   int sim_measure = 0;
   double min_sim = 0;
+  bool distinct_keys = false;
+  bool two = false;
+  int (*pair_pass)(void *, int64_t, int64_t) = nullptr;
+  void *pair_ctx = nullptr;
+  int pair_bits = 0;
   std::vector<std::unique_ptr<tessera::QueryPart>> parts;
   tessera::QueryResult res;
   tessera::PairMode mode = tessera::PairMode::FULL;
@@ -60,7 +65,7 @@ inline void row_of(const tessera_query_c *h, int64_t oi, int64_t oj, bool second
     *x1 = second ? oi : oj;
     return;
   }
-  if (oi == oj || h->mode == tessera::PairMode::FULL) {
+  if (oi == oj || tessera::both_orders(h->mode)) {
     *x0 = second ? oj : oi;
     *x1 = second ? oi : oj;
     return;
@@ -79,11 +84,11 @@ size_t next_rows(tessera_query_c *h, int64_t *x0, int64_t *x1, size_t cap, Put p
   while (n < cap && h->c < out.size()) {
     if (h->q >= tessera::cell_count(out[h->c], wide)) { h->c++; h->q = 0; continue; }
     const tessera::Triple &t = out[h->c].data[wide ? 2 * h->q : h->q];
-    if (t.i == t.j && h->mode == tessera::PairMode::LT) { h->q++; continue; }
+    if (t.i == t.j && !tessera::has_diag(h->mode)) { h->q++; continue; }
     row_of(h, orig[t.i], orig[t.j], h->cross ? h->res.side[t.i] != 0 : h->second, &x0[n], &x1[n]);
     put(n, out[h->c], h->q);
     n++;
-    if (!h->cross && t.i != t.j && h->mode == tessera::PairMode::FULL && !h->second) {
+    if (!h->cross && t.i != t.j && tessera::both_orders(h->mode) && !h->second) {
       h->second = true;
     } else {
       h->second = false;
@@ -132,12 +137,29 @@ int64_t tessera_dict_code(tessera_dict_c *d, const char *s, size_t len) {
 
 void tessera_dict_free(tessera_dict_c *d) { delete d; }
 
+size_t tessera_dict_size(const tessera_dict_c *d) { return d->d.size(); }
+
+const char *tessera_dict_str(const tessera_dict_c *d, int64_t c, size_t *len) {
+  if (c < 0 || (size_t)c >= d->d.size()) return nullptr;
+  const tessera::StrDict::Bytes s = d->d.str(c);
+  if (len) *len = s.size();
+  return s.data();
+}
+
+int tessera_dict_set_order(tessera_dict_c *d, const int64_t *rank, size_t n) {
+  try {
+    return d->d.set_order(std::vector<int64_t>(rank, rank + n)) ? 0 : -1;
+  } catch (...) {
+    return -1;
+  }
+}
+
 void tessera_c_set_xdict(tessera_query_c *h, tessera_dict_c *d) { h->xdict = d; }
 void tessera_c_set_ydict(tessera_query_c *h, tessera_dict_c *d) { h->ydict = d; }
 
 static const char *dict_str(const tessera_dict_c *d, int64_t c, size_t *len) {
   if (!d || c < 0 || (size_t)c >= d->d.size()) return nullptr;
-  const std::string &s = d->d.str(c);
+  const tessera::StrDict::Bytes s = d->d.str(c);
   if (len) *len = s.size();
   return s.data();
 }
@@ -169,7 +191,7 @@ static size_t dict_strings(const tessera_dict_c *dc, char *bytes, size_t bytes_c
   if (!bytes || !offsets || bytes_cap < total || d_cap < d.size() + 1) return d.size();
   size_t o = 0;
   for (size_t c = 0; c < d.size(); c++) {
-    const std::string &x = d.str((int64_t)c);
+    const tessera::StrDict::Bytes x = d.str((int64_t)c);
     offsets[c] = (int64_t)o;
     memcpy(bytes + o, x.data(), x.size());
     o += x.size();
@@ -193,6 +215,20 @@ void tessera_c_set_keep_threads(tessera_query_c *h, int keep) { h->keep_threads 
 void tessera_c_set_similarity(tessera_query_c *h, int measure, double min_sim) {
   h->sim_measure = measure;
   h->min_sim = min_sim;
+}
+
+void tessera_c_set_distinct_keys(tessera_query_c *h, int on) { h->distinct_keys = on != 0; }
+
+void tessera_c_set_pair_filter(tessera_query_c *h, int (*pass)(void *ctx, int64_t a, int64_t b), void *ctx,
+                                int product_bits) {
+  if (h->ran) return;
+  h->pair_pass = pass;
+  h->pair_ctx = ctx;
+  h->pair_bits = product_bits;
+}
+
+void tessera_c_set_two(tessera_query_c *h, int on) {
+  if (!h->ran) h->two = on != 0;
 }
 
 tessera_query_c *tessera_c_new(int has_value) {
@@ -252,15 +288,28 @@ int tessera_c_run(tessera_query_c *h, int mode, int col0_smaller, uint64_t min_v
     set_err(err, errlen, "tessera: unknown similarity measure (1 cosine, 2 Jaccard, 3 Dice, 4 overlap)");
     return TESSERA_C_ERROR;
   }
+  if (mode < 0 || mode > 3) {
+    set_err(err, errlen, "tessera: unknown pair mode (0 all ordered pairs, 1 x0 < x1, 2 x0 <= x1, 3 x0 <> x1)");
+    return TESSERA_C_ERROR;
+  }
   try {
     tessera::QuerySpec s;
     s.has_value = h->has_value;
-    s.mode = mode == 1 ? tessera::PairMode::LT : mode == 2 ? tessera::PairMode::LE : tessera::PairMode::FULL;
+    s.mode = (tessera::PairMode)mode;
     s.min_value = min_value;
     s.topk = topk > 0 ? topk : -1;
     s.threads = threads > 0 ? threads : omp_get_max_threads();
     s.frontier = frontier;
     s.verbose = verbose != 0;
+    if (h->pair_pass && h->pair_bits >= 2 && h->pair_bits <= 64) {
+      s.pair_pass = [](void *c, int64_t a, int64_t b) {
+        tessera_query_c *q = static_cast<tessera_query_c *>(c);
+        return q->pair_pass(q->pair_ctx, a, b) != 0;
+      };
+      s.pair_ctx = h;
+      s.prod_hi = ((__int128)1 << (h->pair_bits - 1)) - 1;
+      s.prod_lo = -s.prod_hi - 1;
+    }
     s.out_budget = h->out_budget;
     s.spill_dir = h->spill_dir;
     s.spill_limit = h->spill_limit;
@@ -269,22 +318,29 @@ int tessera_c_run(tessera_query_c *h, int mode, int col0_smaller, uint64_t min_v
     s.release_threads = !h->keep_threads;
     s.similarity = (tessera::Similarity)h->sim_measure;
     s.min_sim = h->min_sim;
+    s.distinct_keys = h->distinct_keys;
     h->mode = s.mode;
     h->col0_smaller = col0_smaller != 0;
-    auto recode = [](tessera_dict_c *d, std::vector<std::unique_ptr<tessera::QueryPart>> &parts) {
+    auto recode = [](tessera_dict_c *d, std::vector<std::unique_ptr<tessera::QueryPart>> &parts, bool order) {
+      const size_t n = d->d.size();
+      for (auto &p : parts)
+        for (int64_t x : p->x)
+          if (x < 0 || (size_t)x >= n) throw std::runtime_error("tessera: a group key is not a code of its dictionary");
+      if (!order) return;
       const std::vector<int64_t> perm = d->d.finish();
       for (auto &p : parts)
-        for (auto &x : p->x) {
-          if (x < 0 || (size_t)x >= perm.size())
-            throw std::runtime_error("tessera: a group key is not a code of its dictionary");
-          x = perm[(size_t)x];
-        }
+        for (auto &x : p->x) x = perm[(size_t)x];
     };
-    if (h->xdict) recode(h->xdict, h->parts);
-    if (h->ydict) recode(h->ydict, h->parts_y);
+    if (h->xdict) recode(h->xdict, h->parts, !h->cross && !tessera::both_orders(s.mode));
+    if (h->ydict) recode(h->ydict, h->parts_y, false);
+    if (h->two && !h->has_value) throw std::runtime_error("tessera: two aggregates need a handle with values");
     if (h->cross) {
       s.mode = tessera::PairMode::FULL;
       h->mode = s.mode;
+    }
+    if (h->two) {
+      tessera::run_query_two(h->parts, h->cross ? &h->parts_y : nullptr, s, h->res);
+    } else if (h->cross) {
       tessera::run_query_cross(h->parts, h->parts_y, s, h->res);
     } else {
       tessera::run_query(h->parts, s, h->res);
@@ -343,11 +399,11 @@ int tessera_c_next(tessera_query_c *h, int64_t *x0, int64_t *x1, int64_t *vi, do
     }
     if (t.i == t.j) {
       h->q++;
-      if (h->mode == tessera::PairMode::LT) continue;
+      if (!tessera::has_diag(h->mode)) continue;
       row_of(h, oi, oi, false, x0, x1);
       return 1;
     }
-    if (h->mode == tessera::PairMode::FULL && !h->second) {
+    if (tessera::both_orders(h->mode) && !h->second) {
       h->second = true;
       row_of(h, oi, oj, false, x0, x1);
       return 1;
@@ -372,6 +428,13 @@ size_t tessera_c_next_batch(tessera_query_c *h, int64_t *x0, int64_t *x1, int64_
   });
 }
 
+static __int128 round128(double d) {
+  if (std::isnan(d)) return 0;
+  if (d >= 0x1p127) return (__int128)(((unsigned __int128)1 << 127) - 1);
+  if (d < -0x1p127) return -(__int128)(((unsigned __int128)1 << 127) - 1) - 1;
+  return (__int128)std::nearbyint(d);
+}
+
 size_t tessera_c_next_batch128(tessera_query_c *h, int64_t *x0, int64_t *x1, int64_t *hi, uint64_t *lo, size_t cap) {
   const bool gen = h->res.general, wide = h->res.wide;
   return next_rows(h, x0, x1, cap, [&](size_t n, const tessera::Cells &c, size_t q) {
@@ -379,7 +442,7 @@ size_t tessera_c_next_batch128(tessera_query_c *h, int64_t *x0, int64_t *x1, int
     if (gen) {
       double d;
       memcpy(&d, &c.data[q].s, sizeof d);
-      v = (__int128)std::llround(d);
+      v = round128(d);
     } else {
       v = tessera::cell_value128(c, q, wide);
     }
@@ -387,6 +450,35 @@ size_t tessera_c_next_batch128(tessera_query_c *h, int64_t *x0, int64_t *x1, int
     lo[n] = (uint64_t)v;
   });
 }
+
+size_t tessera_c_next_batch2(tessera_query_c *h, int64_t *x0, int64_t *x1, int64_t *count, int64_t *hi, uint64_t *lo,
+                             double *vd, size_t cap) {
+  if (!h->two || h->res.out2.size() != h->res.out.size()) return 0;
+  const bool wide = h->res.wide, gen = h->res.general, gen2 = h->res.general2;
+  return next_rows(h, x0, x1, cap, [&](size_t n, const tessera::Cells &c, size_t q) {
+    if (gen) {
+      double cd;
+      memcpy(&cd, &c.data[q].s, sizeof cd);
+      count[n] = (int64_t)std::llround(cd);
+    } else {
+      count[n] = (int64_t)tessera::cell_value128(c, q, wide);
+    }
+    const __int128 v = h->res.out2[h->c][q];
+    double d;
+    if (gen2) {
+      const uint64_t bits = (uint64_t)v;
+      memcpy(&d, &bits, sizeof d);
+    } else {
+      d = (double)v;
+    }
+    const __int128 iv = gen2 ? round128(d) : v;
+    if (hi) hi[n] = (int64_t)(iv >> 64);
+    if (lo) lo[n] = (uint64_t)iv;
+    if (vd) vd[n] = d;
+  });
+}
+
+int tessera_c_general2(const tessera_query_c *h) { return h->res.general2 ? 1 : 0; }
 
 int tessera_c_general(const tessera_query_c *h) { return h->res.general ? 1 : 0; }
 int tessera_c_wide(const tessera_query_c *h) { return h->res.wide ? 1 : 0; }

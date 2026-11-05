@@ -16,6 +16,7 @@ CREATE TABLE s (k INTEGER NOT NULL, y INTEGER NOT NULL);
 WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < 20000)
 INSERT INTO s SELECT abs(random()) % 1500, (abs(random()) % 300) * (abs(random()) % 300) / 300 FROM g;
 CREATE TABLE u AS SELECT DISTINCT k, x FROM r;
+CREATE TABLE rn AS SELECT k, CASE WHEN x % 10 = 0 THEN NULL ELSE x END AS x, v FROM r;
 SQL
 
 fails=0
@@ -51,6 +52,12 @@ check strings "SELECT x0, x1, s FROM tessera_xtx('r', 'ks', 'xs', NULL, 'lt')" \
   "SELECT a.xs, b.xs, COUNT(*) FROM r a, r b WHERE a.ks = b.ks AND a.xs < b.xs GROUP BY a.xs, b.xs"
 check cross "SELECT x, y, s FROM tessera_xty('r', 'k', 'x', 's', 'k', 'y')" \
   "SELECT a.x, b.y, COUNT(*) FROM r a, s b WHERE a.k = b.k GROUP BY a.x, b.y"
+check null_groups "SELECT x0, x1, s FROM tessera_xtx('rn', 'k', 'x', 'v')" \
+  "SELECT a.x, b.x, SUM(a.v * b.v) FROM rn a, rn b WHERE a.k = b.k GROUP BY a.x, b.x"
+check null_lt "SELECT x0, x1, s FROM tessera_xtx('rn', 'k', 'x', NULL, 'lt')" \
+  "SELECT a.x, b.x, COUNT(*) FROM rn a, rn b WHERE a.k = b.k AND a.x < b.x GROUP BY a.x, b.x"
+check null_cross "SELECT x, y, s FROM tessera_xty('rn', 'k', 'x', 's', 'k', 'y')" \
+  "SELECT a.x, b.y, COUNT(*) FROM rn a, s b WHERE a.k = b.k GROUP BY a.x, b.y"
 SIMREF="WITH c AS (SELECT a.x i, b.x j, COUNT(*) * 1.0 n FROM u a, u b WHERE a.k = b.k AND a.x < b.x GROUP BY a.x, b.x),
   d AS (SELECT x, COUNT(*) * 1.0 n FROM u GROUP BY x)"
 check sim_jaccard "SELECT x0, x1 FROM tessera_sim('u', 'k', 'x', 'jaccard', 0.1)" \

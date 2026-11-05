@@ -87,7 +87,7 @@ linear algebra (54.3 s against 2.9 s on the news articles). Release 1.1.1 reruns
 |---|---|---|
 | SQLite in Python | [`sqlite-tessera`](https://pypi.org/project/sqlite-tessera/) on PyPI | `pip install sqlite-tessera` |
 | SQLite | `tessera-sqlite-<version>-<platform>.tar.gz` on the [releases page](https://github.com/GyuyeongKim/Tessera-public/releases) | `.load ./tessera` in the shell |
-| Spark | `io.github.gyuyeongkim:tessera-spark_2.13` on Maven Central | `--packages io.github.gyuyeongkim:tessera-spark_2.13:1.2.1` |
+| Spark | `io.github.gyuyeongkim:tessera-spark_2.13` on Maven Central | `--packages io.github.gyuyeongkim:tessera-spark_2.13:1.3.0` |
 | PostgreSQL | [`tessera_pg`](https://pgxn.org/dist/tessera_pg/) on PGXN | `pgxn install tessera_pg` |
 | DuckDB | Source | [Engines](#engines) |
 
@@ -153,14 +153,28 @@ one portable build of the sparse path.
 
 ## Supported queries
 
-- Self-join aggregates with `COUNT(*)` or `SUM(a.v * b.v)`, optionally with `a.x < b.x` (or `<=`, `>`, `>=`),
-  `HAVING agg >= c`, `ORDER BY agg DESC LIMIT n`, or `SELECT DISTINCT a.x, b.x`.
-- Products of two relations: `SELECT a.x, b.y, COUNT(*) FROM R a JOIN S b ON a.k = b.k GROUP BY a.x, b.y`, also
-  with `SUM(a.v * b.w)`.
+- Self-joins and joins of two relations grouped by columns of both sides:
+  `SELECT a.x, b.y, COUNT(*) FROM R a JOIN S b ON a.k = b.k GROUP BY a.x, b.y`.
+- Aggregates: `COUNT(*)`, `COUNT` of a column without NULLs, `COUNT(DISTINCT a.k)`, `SUM(a.v * b.w)`, `SUM(a.v)`,
+  `AVG` of such an argument, and a count, a sum and an average of one argument together.
+- Pair filters between the two sides' group columns: `<`, `<=`, `>`, `>=`, `<>`, and `IS DISTINCT FROM`.
+- Keys of several columns (`a.k = b.k AND a.day = b.day`), and keys computed from one side's columns
+  (`a.k % 100 = b.k % 100`, `upper(a.s) = upper(b.s)`).
+- Further group columns (`GROUP BY a.category, a.x, b.x`), groups computed from one side's columns that cannot raise
+  an error (`a.x % 10`, `upper(a.s)`, `date_trunc('month', a.ts)`), and group columns with NULLs, which form their own
+  group.
+- Expressions of the groups and aggregates in the select list (`a.c || '-' || a.x`, `COUNT(*) * 2`), `HAVING`,
+  `ORDER BY agg DESC LIMIT n [OFFSET m]`, window functions above the aggregate, and `SELECT DISTINCT a.x, b.x`.
+- Filters on either side or on both, with different filters on the two sides.
+- Inputs: tables; in PostgreSQL also row-level security, partitioned and inherited tables, subqueries, views, CTEs,
+  set-returning functions, foreign tables and `TABLESAMPLE`; in DuckDB also table functions such as `read_csv`, a
+  subquery's `DISTINCT` or aggregate, and the last join of three relations; in Spark any plan.
 - Item similarity (cosine, Jaccard, Dice, overlap) above a threshold.
 
-Keys and values can be 64-bit integers or strings. Weights can be integers, summed exactly with the engine's own
-overflow errors, or floating-point numbers. Grouped and summed columns must not contain NULLs.
+Keys and groups can be integers, strings, dates and timestamps, and, held as their text, decimals, booleans and in
+DuckDB 128-bit and unsigned 64-bit integers. Weights can be integers, summed exactly with the engine's own overflow
+errors, decimals of up to 18 digits together, summed exactly at the engine's scale, floating-point numbers, and an
+integer or a decimal times a float.
 
 <details>
 <summary>SQL spellings that the planner adapters recognize</summary>
@@ -169,28 +183,33 @@ DuckDB, PostgreSQL, and Spark recognize:
 
 - comma joins, `JOIN ... ON`, `INNER JOIN`, and `JOIN ... USING (k)`, with the tables and the sides of the equality
   in either order;
-- the pair filter (`a.x < b.x`, `b.x > a.x`, `<=`, `>`, `>=`) in `ON` or in `WHERE`;
+- the pair filter (`a.x < b.x`, `b.x > a.x`, `<=`, `>`, `>=`, `<>`, `!=`, `IS DISTINCT FROM`) in `ON` or in `WHERE`;
 - `GROUP BY` in either order or by position, and the select list in any order;
-- `COUNT(*)`, `COUNT(1)`, `COUNT` of a column without NULLs, and `SUM(a.v * b.v)` in either order;
-- `HAVING agg >= c` or `> c`, and `ORDER BY` the aggregate, its alias, or its position with `DESC LIMIT n`;
-- views over the input table.
+- `COUNT(*)`, `COUNT(1)`, `COUNT` of a column without NULLs, `COUNT(DISTINCT a.k)`, `SUM(a.v * b.v)` in either
+  order, and `AVG`;
+- `HAVING` over the aggregates and the group columns (`agg >= c` and `agg > c` on a count or a single sum also
+  prune), and `ORDER BY` the aggregate, its alias, or its position with `DESC LIMIT n [OFFSET m]`;
+- views over the input tables.
 
 These run as the engine's own plan, with the same result:
 
-- `a.x <> b.x` (write `a.x < b.x` to get each pair once);
-- `SELECT DISTINCT a.x, b.x` in PostgreSQL and Spark (DuckDB recognizes it);
-- in PostgreSQL, filters on the joined tables such as `a.x < 300 AND b.x < 300`, and CTEs that PostgreSQL
-  materializes. Write the filtered rows to a table with `NOT NULL` columns, or use `WITH t AS NOT MATERIALIZED`.
+- `MIN` and `MAX`, which need another semiring than the matrix engine's multiply and add, outer joins, and a third
+  relation outside DuckDB's last join;
+- nondeterministic collations, whose equality is not equality of bytes;
+- in PostgreSQL and Spark, `SUM` of `real` / `float` products, which those engines sum in float32.
 
-NULLs: an adapter leaves a query to the engine unless it knows that the columns hold none. DuckDB checks the column
-statistics, PostgreSQL needs valid `NOT NULL` constraints, and Spark needs non-nullable columns or an `IS NOT NULL`
-filter. The SQLite table functions return an error on a NULL group key or value. A DuckDB statement prepared while its
-columns held no NULLs returns an error that asks to prepare it again if NULLs arrive later.
+NULLs: group columns may hold NULLs. A summed column must hold none: an adapter leaves a query to the engine unless it
+knows that the column holds none. DuckDB checks the column statistics, PostgreSQL needs a valid `NOT NULL` constraint,
+and Spark needs a non-nullable column or an `IS NOT NULL` filter. The SQLite table functions take NULL group keys in
+mode `'full'` and in `tessera_xty`, leave their rows out with a pair filter, and return an error on a NULL value. A
+DuckDB statement prepared while its summed columns held no NULLs returns an error that asks to prepare it again if
+NULLs arrive later.
 
 Operators: PostgreSQL's adapter recognizes only PostgreSQL's own operators and aggregates, so a user's `*` earlier on
-the search path keeps the engine's plan. Spark's adapter leaves `try_sum`, `try_multiply`, float weights, and
-`SMALLINT` products to Spark, and integer products without ANSI mode except for `BIGINT`, whose sums wrap as Spark's
-do.
+the search path keeps the engine's plan. A group or key computed from a column must be an expression that cannot raise
+an error on any value (the adapter computes it on every row of its input, where the engine's plan computes it on the
+joined rows only). Spark's adapter leaves `try_sum`, `try_multiply`, `FLOAT` weights, and `SMALLINT` products to Spark,
+and integer products without ANSI mode except for `BIGINT`, whose sums wrap as Spark's do.
 
 </details>
 

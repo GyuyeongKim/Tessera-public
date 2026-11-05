@@ -10,8 +10,11 @@ namespace tessera {
 enum class PairMode : uint8_t {
   FULL,
   LT,
-  LE
+  LE,
+  NE
 };
+inline bool has_diag(PairMode m) { return m == PairMode::FULL || m == PairMode::LE; }
+inline bool both_orders(PairMode m) { return m == PairMode::FULL || m == PairMode::NE; }
 
 struct QueryPart {
   std::vector<int64_t> k, x;
@@ -42,6 +45,10 @@ struct QuerySpec {
   bool release_threads = true;
   Similarity similarity = Similarity::NONE;
   double min_sim = 0;
+  bool distinct_keys = false;
+  bool (*pair_pass)(void* ctx, int64_t a, int64_t b) = nullptr;
+  void* pair_ctx = nullptr;
+  __int128 prod_lo = 0, prod_hi = 0;
 };
 
 struct Cancelled : std::runtime_error {
@@ -56,12 +63,17 @@ struct QueryResult {
   bool int_values = false;
   __int128 prod_min = 0, prod_max = 0, cell_min = 0, cell_max = 0;
   std::vector<uint8_t> side;
+  std::vector<std::vector<__int128>> out2;
+  bool general2 = false;
 };
 
 void run_query(std::vector<std::unique_ptr<QueryPart>>& parts, const QuerySpec& q, QueryResult& r);
 
 void run_query_cross(std::vector<std::unique_ptr<QueryPart>>& parts_x, std::vector<std::unique_ptr<QueryPart>>& parts_y,
                      const QuerySpec& spec, QueryResult& r);
+
+void run_query_two(std::vector<std::unique_ptr<QueryPart>>& parts, std::vector<std::unique_ptr<QueryPart>>* parts_y,
+                   const QuerySpec& spec, QueryResult& r);
 
 double cell_value(uint64_t s, bool general);
 inline __int128 cell_value128(const Cells& c, size_t q, bool wide) {
@@ -73,14 +85,25 @@ int overflow_flags(const QueryResult& r, int product_bits, int sum_bits);
 
 class StrDict {
  public:
+  struct Bytes {
+    const char* p;
+    size_t n;
+    const char* data() const { return p; }
+    size_t size() const { return n; }
+    char operator[](size_t i) const { return p[i]; }
+  };
   int64_t code(const char* s, size_t len);
   std::vector<int64_t> finish();
-  size_t size() const { return strs_.size(); }
-  const std::string& str(int64_t c) const { return *strs_[(size_t)c]; }
+  size_t size() const { return off_.size() - 1; }
+  Bytes str(int64_t c) const { return Bytes{bytes_.data() + off_[(size_t)c], (size_t)(off_[(size_t)c + 1] - off_[(size_t)c])}; }
+  bool set_order(const std::vector<int64_t>& rank);
 
  private:
-  std::unordered_map<std::string, int64_t> map_;
-  std::vector<const std::string*> strs_;
+  void grow();
+  std::vector<char> bytes_;
+  std::vector<uint64_t> off_{0};
+  std::vector<uint64_t> slot_;
+  std::vector<int64_t> rank_;
 };
 
 }

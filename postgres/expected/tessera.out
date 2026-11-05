@@ -100,7 +100,7 @@ ALTER TABLE nv ADD CONSTRAINT nv_x_nn NOT NULL x NOT VALID;
 SELECT uses_tessera('SELECT a.x, b.x, sum(a.v * b.v) FROM nv a JOIN nv b ON a.k = b.k GROUP BY a.x, b.x');
  uses_tessera 
 --------------
- f
+ t
 (1 row)
 
 CREATE SCHEMA u;
@@ -134,6 +134,159 @@ SELECT count(*) FROM tessera_sim('t', 'k', 'x', 'cosine', 0.5, mode => 'full');
    169
 (1 row)
 
+CREATE TABLE f (k int4 NOT NULL, x int4 NOT NULL, k2 int4 NOT NULL, c int4 NOT NULL, v int4 NOT NULL, dt date NOT NULL,
+  pr numeric(9, 2) NOT NULL);
+INSERT INTO f SELECT i % 60, (i * 7) % 17, i % 3, i % 4, i % 5 + 1, DATE '2024-01-01' + (i * 7) % 17, (i % 5) * 1.25
+  FROM generate_series(0, 2999) i;
+CREATE TABLE fp (k int4 NOT NULL, x int4 NOT NULL) PARTITION BY RANGE (k);
+CREATE TABLE fp0 PARTITION OF fp FOR VALUES FROM (0) TO (30);
+CREATE TABLE fp1 PARTITION OF fp FOR VALUES FROM (30) TO (60);
+INSERT INTO fp SELECT k, x FROM f;
+CREATE TABLE fn AS SELECT k, x, c, k2, v, CASE WHEN x % 5 = 0 THEN NULL ELSE x END AS nx FROM f;
+ANALYZE f; ANALYZE fp; ANALYZE fn;
+CREATE FUNCTION queries27() RETURNS TABLE (q text, i text, j text, s numeric) LANGUAGE sql AS $$
+  SELECT 'ne', a.x::text, b.x::text, count(*)::numeric FROM f a JOIN f b ON a.k = b.k AND a.x <> b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'distinct', a.x::text, b.x::text, count(DISTINCT a.k) FROM f a JOIN f b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL (SELECT 'offset', a.x::text, b.x::text, count(*) FROM f a JOIN f b ON a.k = b.k AND a.x < b.x
+    GROUP BY a.x, b.x ORDER BY count(*) DESC, 2, 3 LIMIT 5 OFFSET 3)
+  UNION ALL SELECT 'having', a.x::text, b.x::text, count(*) FROM f a JOIN f b ON a.k = b.k GROUP BY a.x, b.x
+    HAVING count(*) BETWEEN 300 AND 900
+  UNION ALL SELECT 'one_side', a.x::text, b.x::text, count(*) FROM f a JOIN f b ON a.k = b.k WHERE a.c = 1 GROUP BY a.x, b.x
+  UNION ALL SELECT 'key2', a.x::text, b.x::text, sum(a.v * b.v) FROM f a JOIN f b ON a.k = b.k AND a.k2 = b.k2
+    GROUP BY a.x, b.x
+  UNION ALL SELECT 'group3', a.c || '|' || a.x, b.x::text, count(*) FROM f a JOIN f b ON a.k = b.k AND a.x < b.x
+    GROUP BY a.c, a.x, b.x
+  UNION ALL SELECT 'sum_one', a.x::text, b.x::text, sum(a.v) FROM f a JOIN f b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'date', a.dt::text, b.dt::text, count(*) FROM f a JOIN f b ON a.k = b.k AND a.dt < b.dt
+    GROUP BY a.dt, b.dt
+  UNION ALL SELECT 'two', a.x::text, b.x::text || '|' || sum(a.v * b.v), count(*) FROM f a JOIN f b ON a.k = b.k
+    GROUP BY a.x, b.x
+  UNION ALL SELECT 'avg', a.x::text, b.x::text, avg(a.v * b.v) FROM f a JOIN f b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'avg_three', a.x::text, b.x::text || '|' || count(*) || '|' || sum(a.v * b.v), avg(a.v * b.v)
+    FROM f a JOIN f b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'decimal', a.x::text, b.x::text, sum(a.pr * b.pr) FROM f a JOIN f b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'avg_dec', a.x::text, b.x::text || '|' || sum(a.pr), avg(a.pr) FROM f a JOIN f b ON a.k = b.k
+    WHERE a.c = 1 GROUP BY a.x, b.x
+  UNION ALL SELECT 'null', a.nx::text, b.x::text, count(*) FROM fn a JOIN fn b ON a.k = b.k GROUP BY a.nx, b.x
+  UNION ALL SELECT 'null_lt', a.nx::text, b.nx::text, sum(a.v * b.v) FROM fn a JOIN fn b ON a.k = b.k AND a.nx < b.nx
+    GROUP BY a.nx, b.nx
+  UNION ALL SELECT 'null_distinct', a.nx::text, b.nx::text, count(*) FROM fn a JOIN fn b
+    ON a.k = b.k AND a.nx IS DISTINCT FROM b.nx GROUP BY a.nx, b.nx
+  UNION ALL SELECT 'key_expr', a.x::text, b.x::text, count(*) FROM f a JOIN f b ON a.k % 20 = b.k % 20 GROUP BY a.x, b.x
+  UNION ALL SELECT 'subquery', a.x::text, b.x::text, count(*) FROM (SELECT k, x FROM f WHERE c = 1 OFFSET 0) a JOIN f b
+    ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'expr_mod', (a.x % 4)::text, b.x::text, count(*) FROM fn a JOIN fn b ON a.k = b.k
+    GROUP BY a.x % 4, b.x
+  UNION ALL SELECT 'expr_concat', a.c || '-' || a.k2, (b.x / 3)::text, count(*) FROM fn a JOIN fn b ON a.k = b.k
+    GROUP BY a.c || '-' || a.k2, b.x / 3
+  UNION ALL SELECT 'distinct_pairs', i::text, j::text, 1 FROM (SELECT DISTINCT a.x AS i, b.x AS j FROM f a JOIN f b
+    ON a.k = b.k) d
+  UNION ALL SELECT 'window', i::text, j::text, c FROM (SELECT a.x AS i, b.x AS j, count(*) AS c, row_number() OVER
+    (PARTITION BY a.x ORDER BY count(*) DESC, b.x) AS rn FROM f a JOIN f b ON a.k = b.k GROUP BY a.x, b.x) w WHERE rn <= 2
+  UNION ALL SELECT 'partitioned', a.x::text, b.x::text, count(*) FROM fp a JOIN fp b ON a.k = b.k GROUP BY a.x, b.x
+$$;
+CREATE TABLE with_hook27 AS SELECT * FROM queries27();
+SET tessera.enabled = off;
+CREATE TABLE without_hook27 AS SELECT * FROM queries27();
+SET tessera.enabled = on;
+SELECT count(*) AS differing_rows FROM ((SELECT * FROM with_hook27 EXCEPT ALL SELECT * FROM without_hook27)
+  UNION ALL (SELECT * FROM without_hook27 EXCEPT ALL SELECT * FROM with_hook27)) d;
+ differing_rows 
+----------------
+              0
+(1 row)
+
+SELECT q, count(*) FROM with_hook27 GROUP BY q ORDER BY q;
+       q        | count 
+----------------+-------
+ avg            |   289
+ avg_dec        |   289
+ avg_three      |   136
+ date           |   136
+ decimal        |   289
+ distinct       |   289
+ distinct_pairs |   289
+ expr_concat    |    72
+ expr_mod       |    68
+ group3         |   544
+ having         |   289
+ key2           |   289
+ key_expr       |   289
+ ne             |   272
+ null           |   238
+ null_distinct  |   182
+ null_lt        |    78
+ offset         |     5
+ one_side       |   289
+ partitioned    |   289
+ subquery       |   289
+ sum_one        |   289
+ two            |   289
+ window         |    34
+(24 rows)
+
+SELECT uses_tessera('SELECT a.x, b.x, count(*) FROM f a JOIN f b ON a.k = b.k AND a.x <> b.x GROUP BY a.x, b.x');
+ uses_tessera 
+--------------
+ t
+(1 row)
+
+SELECT uses_tessera('SELECT a.x, b.x, count(*) FROM f a JOIN f b ON a.k = b.k AND a.k2 = b.k2 GROUP BY a.x, b.x');
+ uses_tessera 
+--------------
+ t
+(1 row)
+
+SELECT uses_tessera('SELECT a.c, a.x, b.x, count(*) FROM f a JOIN f b ON a.k = b.k GROUP BY a.c, a.x, b.x');
+ uses_tessera 
+--------------
+ t
+(1 row)
+
+SELECT uses_tessera('SELECT a.x, b.x, count(*), sum(a.v * b.v) FROM f a JOIN f b ON a.k = b.k GROUP BY a.x, b.x');
+ uses_tessera 
+--------------
+ t
+(1 row)
+
+SELECT uses_tessera('SELECT a.x, b.x, count(*) FROM fp a JOIN fp b ON a.k = b.k GROUP BY a.x, b.x');
+ uses_tessera 
+--------------
+ t
+(1 row)
+
+SELECT uses_tessera('SELECT a.x, b.x, avg(a.v * b.v) FROM f a JOIN f b ON a.k = b.k GROUP BY a.x, b.x');
+ uses_tessera 
+--------------
+ t
+(1 row)
+
+SELECT uses_tessera('SELECT a.x, b.x, sum(a.pr * b.pr) FROM f a JOIN f b ON a.k = b.k GROUP BY a.x, b.x');
+ uses_tessera 
+--------------
+ t
+(1 row)
+
+SELECT uses_tessera('SELECT a.nx, b.x, count(*) FROM fn a JOIN fn b ON a.k = b.k GROUP BY a.nx, b.x');
+ uses_tessera 
+--------------
+ t
+(1 row)
+
+SELECT uses_tessera('SELECT a.x % 4, b.x, count(*) FROM fn a JOIN fn b ON a.k = b.k GROUP BY a.x % 4, b.x');
+ uses_tessera 
+--------------
+ t
+(1 row)
+
+SELECT uses_tessera('SELECT a.x, b.x, count(*) FROM (SELECT k, x FROM f WHERE c = 1 OFFSET 0) a JOIN f b ON a.k = b.k GROUP BY a.x, b.x');
+ uses_tessera 
+--------------
+ t
+(1 row)
+
+DROP TABLE f, fp, fn, with_hook27, without_hook27;
+DROP FUNCTION queries27();
 DROP SCHEMA u CASCADE;
 DROP TABLE t, big, ov, s, r, r2, with_hook, without_hook, nv;
 DROP FUNCTION queries(), uses_tessera(text);

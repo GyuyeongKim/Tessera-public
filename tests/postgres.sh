@@ -13,10 +13,10 @@ PSQL=("$PGBIN/psql" -h "$W" -p "$PORT" -U postgres -d postgres -X -q -A -t -F, -
 CREATE EXTENSION tessera_pg;
 SELECT setseed(0.42);
 CREATE TABLE r (k int NOT NULL, x int NOT NULL, v float8 NOT NULL, kw bigint NOT NULL, xw bigint NOT NULL,
-                ks text NOT NULL, xs text COLLATE "C" NOT NULL);
+                ks text NOT NULL, xs text COLLATE "C" NOT NULL, xn int);
 INSERT INTO r
   SELECT k, x, v, k * 1000000007::bigint - 4000000000000000000, x * 999999937::bigint + 3000000000000000000,
-         'k' || k, 'item-' || x
+         'k' || k, 'item-' || x, CASE WHEN x % 10 = 0 THEN NULL ELSE x END
   FROM (SELECT (random() * 2000)::int AS k, floor(power(random(), 3) * 600)::int AS x,
                (1 + floor(random() * 5))::float8 AS v
         FROM generate_series(1, 60000)) g;
@@ -72,6 +72,20 @@ check join_using "" "SELECT a.x i, b.x j, COUNT(*) s FROM r a JOIN r b USING (k)
 check cross_count "" "SELECT a.x i, b.y j, COUNT(*) s FROM r a, s b WHERE a.k = b.k GROUP BY a.x, b.y"
 check cross_join "" "SELECT a.x i, b.y j, COUNT(*) s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y"
 check cross_sum "" "SELECT a.x i, b.y j, SUM(a.v * b.w) s FROM r a, s b WHERE a.k = b.k GROUP BY a.x, b.y"
+check ne "" "SELECT a.x i, b.x j, COUNT(*) s $SELF AND a.x <> b.x GROUP BY a.x, b.x"
+check avg "" "SELECT a.x i, b.x j, AVG(a.v * b.v) s $SELF GROUP BY a.x, b.x"
+check three_aggs "" "SELECT a.x i, b.y j, COUNT(*) s, SUM(a.v * b.w) t, AVG(a.v * b.w) m FROM r a, s b WHERE a.k = b.k
+  GROUP BY a.x, b.y"
+check count_distinct "" "SELECT a.x i, b.x j, COUNT(DISTINCT a.k) s $SELF AND a.x < b.x GROUP BY a.x, b.x"
+check key_two_columns "" "SELECT a.x i, b.x j, COUNT(*) s FROM r a, r b WHERE a.k = b.k AND a.x % 4 = b.x % 4 GROUP BY a.x, b.x"
+check key_computed "" "SELECT a.x i, b.y j, COUNT(*) s FROM r a, s b WHERE a.k % 500 = b.k % 500 GROUP BY a.x, b.y"
+check group_computed "" "SELECT a.x % 10 i, b.x j, COUNT(*) s $SELF GROUP BY a.x % 10, b.x"
+check group_three "" "SELECT a.x % 3 c, a.x i, b.y j, COUNT(*) s FROM r a, s b WHERE a.k = b.k GROUP BY a.x % 3, a.x, b.y"
+check null_groups "" "SELECT a.xn i, b.xn j, COUNT(*) s $SELF GROUP BY a.xn, b.xn"
+check null_distinct_from "" "SELECT a.xn i, b.xn j, COUNT(*) s $SELF AND a.xn IS DISTINCT FROM b.xn GROUP BY a.xn, b.xn"
+check filters "" "SELECT a.x i, b.y j, SUM(a.v * b.w) s FROM r a, s b WHERE a.k = b.k AND a.v > 2 AND b.w < 3 GROUP BY a.x, b.y"
+check subquery_input "" "SELECT a.x i, b.y j, COUNT(*) s FROM (SELECT * FROM r WHERE x < 300) a JOIN s b ON a.k = b.k
+  GROUP BY a.x, b.y"
 
 sim() {
   local name=$1 measure=$2 t=$3 formula=$4 res

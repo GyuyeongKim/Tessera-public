@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define TESSERA_API_VERSION 3
+#define TESSERA_API_VERSION 4
 int tessera_c_api_version(void);
 const char *tessera_c_version(void);
 const char *tessera_c_isa(void);
@@ -33,6 +33,9 @@ int tessera_c_add_y_i64(tessera_query_c *q, const int64_t *k, const int64_t *y, 
 tessera_dict_c *tessera_dict_new(void);
 int64_t tessera_dict_code(tessera_dict_c *d, const char *s, size_t len);
 void tessera_dict_free(tessera_dict_c *d);
+size_t tessera_dict_size(const tessera_dict_c *d);
+const char *tessera_dict_str(const tessera_dict_c *d, int64_t c, size_t *len);
+int tessera_dict_set_order(tessera_dict_c *d, const int64_t *rank, size_t n);
 void tessera_c_set_xdict(tessera_query_c *q, tessera_dict_c *d);
 const char *tessera_c_xstr(const tessera_query_c *q, int64_t x, size_t *len);
 void tessera_c_set_ydict(tessera_query_c *q, tessera_dict_c *d);
@@ -48,12 +51,19 @@ size_t tessera_c_ystrings(const tessera_query_c *q, char *bytes, size_t bytes_ca
                           size_t *bytes_out);
 void tessera_c_set_keep_threads(tessera_query_c *q, int keep);
 void tessera_c_set_similarity(tessera_query_c *q, int measure, double min_sim);
+void tessera_c_set_distinct_keys(tessera_query_c *q, int on);
+void tessera_c_set_two(tessera_query_c *q, int on);
+void tessera_c_set_pair_filter(tessera_query_c *q, int (*pass)(void *ctx, int64_t a, int64_t b), void *ctx,
+                               int product_bits);
 
 int tessera_c_run(tessera_query_c *q, int mode, int col0_smaller, uint64_t min_value, int64_t topk, int threads,
                   int64_t frontier, int verbose, char *err, size_t errlen);
 int tessera_c_next(tessera_query_c *q, int64_t *x0, int64_t *x1, int64_t *vi, double *vd, int *general);
 size_t tessera_c_next_batch(tessera_query_c *q, int64_t *x0, int64_t *x1, int64_t *vi, double *vd, size_t cap);
 int tessera_c_general(const tessera_query_c *q);
+size_t tessera_c_next_batch2(tessera_query_c *q, int64_t *x0, int64_t *x1, int64_t *count, int64_t *hi, uint64_t *lo,
+                             double *vd, size_t cap);
+int tessera_c_general2(const tessera_query_c *q);
 int tessera_c_wide(const tessera_query_c *q);
 size_t tessera_c_next_batch128(tessera_query_c *q, int64_t *x0, int64_t *x1, int64_t *hi, uint64_t *lo, size_t cap);
 int tessera_c_overflow(const tessera_query_c *q, int product_bits, int sum_bits);

@@ -31,8 +31,8 @@ object TesseraSim {
       case _ => throw new IllegalArgumentException("tessera similarity: measure is 'cosine', 'jaccard', 'dice' or 'overlap'")
     }
     val md = mode match {
-      case "full" => 0; case "lt" => 1; case "le" => 2
-      case _ => throw new IllegalArgumentException("tessera similarity: mode is 'lt', 'le' or 'full'")
+      case "full" => 0; case "lt" => 1; case "le" => 2; case "ne" => 3
+      case _ => throw new IllegalArgumentException("tessera similarity: mode is 'lt', 'le', 'full' or 'ne'")
     }
     val in = df.select((Seq(k, x) ++ Option(v)).map(df.col): _*)
     val child = in.queryExecution.analyzed

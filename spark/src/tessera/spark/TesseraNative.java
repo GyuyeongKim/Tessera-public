@@ -77,8 +77,14 @@ public final class TesseraNative {
 
   public static native void cancel(long h);
   public static native void setSimilarity(long h, int measure, double minSim);
+  public static native void setDistinctKeys(long h, boolean on);
 
   public static native int next(long h, long[] x0, long[] x1, long[] vi, double[] vd);
+  public static native int next2(long h, long[] x0, long[] x1, long[] cnt, long[] vi, double[] vd);
+  public static native int next128(long h, long[] x0, long[] x1, long[] hi, long[] lo);
+  public static native int next2Wide(long h, long[] x0, long[] x1, long[] cnt, long[] hi, long[] lo, double[] vd);
+  public static native void setTwo(long h, boolean on);
+  public static native void setPairFilter(long h, Object filter, int productBits);
 
   public static native boolean general(long h);
 

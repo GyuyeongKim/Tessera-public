@@ -13,7 +13,7 @@ OBJS = $(O)/common.o $(O)/query.o $(O)/tessera_c.o $(O)/core_avx2.o $(O)/dispatc
   $(O)/core_vnni.o $(O)/core_amx.o
 endif
 
-SOVER = 3
+SOVER = 4
 VERSION = $(shell sed -n 's/.*kVersion = "\(.*\)";/\1/p' tessera.hpp)
 PREFIX ?= /usr/local
 LDFLAGS ?=

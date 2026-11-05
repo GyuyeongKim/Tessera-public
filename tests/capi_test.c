@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +63,7 @@ static size_t brute(const int64_t *k, const int64_t *x, const double *v, size_t 
       if (k[a] != k[b]) continue;
       if (mode == 1 && !(x[a] < x[b])) continue;
       if (mode == 2 && !(x[a] <= x[b])) continue;
+      if (mode == 3 && x[a] == x[b]) continue;
       r[m].x0 = x[a];
       r[m].x1 = x[b];
       r[m].v = v ? v[a] * v[b] : 1;
@@ -382,6 +384,7 @@ static void test_similarity(int measure, double t, int mode, int with_v, int dup
   for (size_t i = 0; i < nb; i++) {
     if (mode == 1 && b[i].x0 >= b[i].x1) continue;
     if (mode == 2 && b[i].x0 > b[i].x1) continue;
+    if (mode == 3 && b[i].x0 == b[i].x1) continue;
     double ni = 0, nj = 0;
     for (size_t q = 0; q < nx; q++) {
       if (ix[q] == b[i].x0) ni = sz[q];
@@ -441,6 +444,7 @@ static void test_similarity_nested(int measure, double t, int mode, int64_t fron
   for (size_t i = 0; i < nb; i++) {
     if (mode == 1 && b[i].x0 >= b[i].x1) continue;
     if (mode == 2 && b[i].x0 > b[i].x1) continue;
+    if (mode == 3 && b[i].x0 == b[i].x1) continue;
     double ni = 0, nj = 0;
     for (size_t q = 0; q < nx; q++) {
       if (ix[q] == b[i].x0) ni = sz[q];
@@ -488,6 +492,159 @@ static void test_bag(int mode, double minv) {
   tessera_c_free(q);
 }
 
+static void test_distinct_keys(int mode, int cross, double minv) {
+  enum { N = 3000 };
+  static int64_t k[N], x[N], dk[N], dx[N];
+  static double v[N];
+  size_t nd = 0;
+  for (int i = 0; i < N; i++) {
+    k[i] = (int64_t)(next_u64() % (i < 2000 ? 3 : 60));
+    x[i] = i < 2000 ? (int64_t)(next_u64() % 3) : 3 + (int64_t)(next_u64() % 50);
+    v[i] = 1;
+    int seen = 0;
+    for (size_t j = 0; j < nd && !seen; j++) seen = dk[j] == k[i] && dx[j] == x[i];
+    if (!seen) {
+      dk[nd] = k[i];
+      dx[nd] = x[i];
+      nd++;
+    }
+  }
+  tessera_query_c *q = cross ? tessera_c_new_cross(0) : tessera_c_new(0);
+  CHECK(q && tessera_c_add(q, k, x, NULL, N) == TESSERA_C_OK, "distinct add");
+  if (cross) CHECK(tessera_c_add_y(q, k, x, NULL, N) == TESSERA_C_OK, "distinct add_y");
+  tessera_c_set_distinct_keys(q, 1);
+  char err[256];
+  CHECK(tessera_c_run(q, mode, 1, (uint64_t)(minv > 0 ? minv : 0), -1, 4, -1, 0, err, sizeof err) == TESSERA_C_OK,
+        "distinct run: %s", err);
+  Row *a, *b;
+  size_t na = collect(q, 1, minv, &a), nb = brute(dk, dx, NULL, nd, cross ? 0 : mode, minv, &b);
+  CHECK(same(a, na, b, nb), "distinct keys mode %d cross %d having %g: %zu rows vs brute force %zu", mode, cross, minv, na,
+        nb);
+  free(a);
+  free(b);
+  tessera_c_free(q);
+  q = tessera_c_new(1);
+  tessera_c_add(q, k, x, v, N);
+  tessera_c_set_distinct_keys(q, 1);
+  CHECK(tessera_c_run(q, mode, 1, 0, -1, 4, -1, 0, err, sizeof err) == TESSERA_C_ERROR, "distinct keys with values ran");
+  tessera_c_free(q);
+}
+
+static void test_two(int mode, int cross, int frac, double minc) {
+  enum { N = 2500 };
+  static int64_t k[N], x[N];
+  static double v[N];
+  for (int i = 0; i < N; i++) {
+    k[i] = (int64_t)(next_u64() % 300);
+    x[i] = (int64_t)((next_u64() % 60) * (next_u64() % 60) / 59);
+    v[i] = frac ? 0.25 * (double)(1 + next_u64() % 9) - 1.0 : (double)(1 + next_u64() % 5);
+  }
+  tessera_query_c *q = cross ? tessera_c_new_cross(1) : tessera_c_new(1);
+  CHECK(q && tessera_c_add(q, k, x, v, N) == TESSERA_C_OK, "two add");
+  if (cross) CHECK(tessera_c_add_y(q, k, x, v, N) == TESSERA_C_OK, "two add_y");
+  tessera_c_set_two(q, 1);
+  char err[256];
+  CHECK(tessera_c_run(q, mode, 1, (uint64_t)(minc > 0 ? minc : 0), -1, 4, -1, 0, err, sizeof err) == TESSERA_C_OK,
+        "two run: %s", err);
+  Row *bc, *bs;
+  const int bm = cross ? 0 : mode;
+  size_t nc = brute(k, x, NULL, N, bm, minc, &bc), ns = brute(k, x, v, N, bm, -1e300, &bs);
+  size_t m = 0, bad = 0;
+  int64_t x0[5], x1[5], cnt[5], hi[5];
+  uint64_t lo[5];
+  double vd[5];
+  for (;;) {
+    size_t got = tessera_c_next_batch2(q, x0, x1, cnt, hi, lo, vd, 5);
+    if (!got) break;
+    for (size_t i = 0; i < got; i++) {
+      if ((double)cnt[i] < minc) continue;
+      size_t a = 0, b = nc;
+      while (a < b) {
+        size_t c = (a + b) / 2;
+        if (bc[c].x0 < x0[i] || (bc[c].x0 == x0[i] && bc[c].x1 < x1[i])) a = c + 1;
+        else b = c;
+      }
+      size_t sa = 0, sb = ns;
+      while (sa < sb) {
+        size_t c = (sa + sb) / 2;
+        if (bs[c].x0 < x0[i] || (bs[c].x0 == x0[i] && bs[c].x1 < x1[i])) sa = c + 1;
+        else sb = c;
+      }
+      if (a == nc || bc[a].x0 != x0[i] || bc[a].x1 != x1[i] || bc[a].v != (double)cnt[i] || sa == ns ||
+          bs[sa].x0 != x0[i] || bs[sa].x1 != x1[i] || fabs(bs[sa].v - vd[i]) > 1e-9 * (1 + fabs(vd[i])) ||
+          (!frac && (hi[i] != 0 || (double)lo[i] != bs[sa].v)))
+        bad++;
+      m++;
+    }
+  }
+  CHECK(tessera_c_general2(q) == frac, "two: general2 %d for frac %d", tessera_c_general2(q), frac);
+  CHECK(bad == 0 && m == nc, "two mode %d cross %d frac %d having %g: %zu rows (brute force %zu), %zu wrong", mode, cross,
+        frac, minc, m, nc, bad);
+  free(bc);
+  free(bs);
+  tessera_c_free(q);
+}
+
+static void test_dict_order(void) {
+  enum { N = 3000, NS = 12 };
+  const char *pool[NS] = {"a", "B", "apple", "Apple", "b", "banana", "z", "Zed", "zz", "m", "M", "mango"};
+  int64_t k[N], x[N];
+  tessera_dict_c *d1 = tessera_dict_new(), *d2 = tessera_dict_new();
+  int64_t x2[N];
+  for (int i = 0; i < N; i++) {
+    const char *t = pool[(next_u64() % NS) * (next_u64() % NS) / (NS - 1)];
+    k[i] = (int64_t)(next_u64() % 400);
+    x[i] = tessera_dict_code(d1, t, strlen(t));
+    x2[i] = tessera_dict_code(d2, t, strlen(t));
+  }
+  const size_t n = tessera_dict_size(d1);
+  int64_t rank[NS];
+  for (size_t c = 0; c < n; c++) {
+    size_t lc, lo;
+    const char *sc = tessera_dict_str(d1, (int64_t)c, &lc);
+    rank[c] = 0;
+    for (size_t o = 0; o < n; o++) {
+      const char *so = tessera_dict_str(d1, (int64_t)o, &lo);
+      const int m = memcmp(so, sc, lo < lc ? lo : lc);
+      rank[c] += m > 0 || (m == 0 && lo > lc);
+    }
+  }
+  int64_t bad_rank[NS];
+  memcpy(bad_rank, rank, sizeof rank);
+  bad_rank[0] = bad_rank[1];
+  CHECK(tessera_dict_set_order(d1, bad_rank, n) == -1, "dict order: a non-permutation accepted");
+  CHECK(tessera_dict_set_order(d1, rank, n) == 0, "dict order: set_order failed");
+  tessera_query_c *q1 = tessera_c_new(0), *q2 = tessera_c_new(0);
+  CHECK(q1 && q2 && tessera_c_add(q1, k, x, NULL, N) == 0 && tessera_c_add(q2, k, x2, NULL, N) == 0, "dict order add");
+  tessera_c_set_xdict(q1, d1);
+  tessera_c_set_xdict(q2, d2);
+  char err[256];
+  CHECK(tessera_c_run(q1, 1, 1, 0, -1, 4, -1, 0, err, sizeof err) == 0 && tessera_c_run(q2, 1, 1, 0, -1, 4, -1, 0, err, sizeof err) == 0,
+        "dict order run: %s", err);
+  int64_t a0, a1, vi;
+  double vd;
+  int gen;
+  long n1 = 0, n2 = 0, sum1 = 0, sum2 = 0, wrong = 0;
+  while (tessera_c_next(q1, &a0, &a1, &vi, &vd, &gen)) {
+    size_t l0, l1;
+    const char *s0 = tessera_c_xstr(q1, a0, &l0), *s1 = tessera_c_xstr(q1, a1, &l1);
+    const int m = memcmp(s0, s1, l0 < l1 ? l0 : l1);
+    wrong += !(m > 0 || (m == 0 && l0 > l1));
+    n1++;
+    sum1 += vi;
+  }
+  while (tessera_c_next(q2, &a0, &a1, &vi, &vd, &gen)) {
+    n2++;
+    sum2 += vi;
+  }
+  CHECK(wrong == 0 && n1 == n2 && sum1 == sum2 && n1 > 0, "dict order: %ld wrong orientations, rows %ld vs %ld, sums %ld vs %ld",
+        wrong, n1, n2, sum1, sum2);
+  tessera_c_free(q1);
+  tessera_c_free(q2);
+  tessera_dict_free(d1);
+  tessera_dict_free(d2);
+}
+
 static int polls = 0, stop_at = 0;
 static int stop_cb(void *ctx) {
   (void)ctx;
@@ -527,7 +684,7 @@ int main(void) {
   printf("tessera %s, API %d (header %d), core variant %s\n", tessera_c_version(), tessera_c_api_version(),
          TESSERA_API_VERSION, tessera_c_isa());
   if (tessera_c_api_version() != TESSERA_API_VERSION) return 2;
-  for (int mode = 0; mode < 3; mode++)
+  for (int mode = 0; mode < 4; mode++)
     for (int v = 0; v < 2; v++)
       for (int batch = 0; batch < 2; batch++) {
         test_wide(mode, v, batch, 0, 0);
@@ -535,7 +692,7 @@ int main(void) {
       }
   test_wide(1, 0, 1, 0, 30);
   test_wide(0, 1, 0, 1, 50);
-  for (int mode = 0; mode < 3; mode++)
+  for (int mode = 0; mode < 4; mode++)
     for (int v = 0; v < 2; v++) test_strings(mode, v);
   test_cancel(3);
   test_cancel(10);
@@ -551,7 +708,7 @@ int main(void) {
   test_cross_strings(1);
   for (value_kind = 1; value_kind <= 2; value_kind++) {
     const double having = value_kind == 1 ? 2e9 : 5e9;
-    for (int mode = 0; mode < 3; mode++) test_wide(mode, 1, mode & 1, 0, 0);
+    for (int mode = 0; mode < 4; mode++) test_wide(mode, 1, mode & 1, 0, 0);
     test_wide(1, 1, 0, 1, 0);
     test_wide(0, 1, 1, 0, having);
     test_cross(1, 0, 0, 0, -1, 4000, 3000, 300, 200, 150);
@@ -563,10 +720,22 @@ int main(void) {
     fprintf(stderr, "FAIL: only %d runs of the value tests took the integer sparse path\n", wide_runs);
     fails++;
   }
-  for (int mode = 0; mode < 3; mode++) test_bag(mode, -1);
+  for (int mode = 0; mode < 4; mode++) test_bag(mode, -1);
   test_bag(1, 1000);
+  test_bag(3, 1000);
+  for (int mode = 0; mode < 4; mode++) test_distinct_keys(mode, 0, -1);
+  test_distinct_keys(1, 0, 20);
+  test_distinct_keys(0, 1, -1);
+  test_distinct_keys(0, 1, 20);
+  test_dict_order();
+  for (int mode = 0; mode < 4; mode++)
+    for (int frac = 0; frac < 2; frac++) test_two(mode, 0, frac, -1);
+  test_two(1, 0, 0, 30);
+  test_two(0, 1, 0, -1);
+  test_two(0, 1, 1, -1);
+  test_two(0, 1, 0, 30);
   for (int measure = 1; measure <= 4; measure++)
-    for (int mode = 0; mode < 3; mode++) {
+    for (int mode = 0; mode < 4; mode++) {
       test_similarity(measure, 0.3, mode, 0, 0, -1);
       test_similarity(measure, 0.6, mode, 0, 0, 256);
       test_similarity(measure, 0.2, mode, 1, 1, -1);
