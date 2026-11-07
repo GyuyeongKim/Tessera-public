@@ -58,7 +58,7 @@ jobs:
             native/
 
   macos:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
@@ -68,7 +68,22 @@ jobs:
           distribution: temurin
           java-version: "21"
       - name: Tools
-        run: brew install llvm libomp python@3.12
+        run: brew install llvm python@3.12
+      - name: OpenMP runtime for macOS 14
+        run: |
+          LV=$(brew list --versions llvm | awk '{print $2}' | cut -d_ -f1)
+          git clone -q --depth 1 --branch "llvmorg-$LV" --filter=blob:none --sparse \
+            https://github.com/llvm/llvm-project.git /tmp/llvm-project
+          git -C /tmp/llvm-project sparse-checkout set openmp cmake runtimes llvm/cmake llvm/utils/llvm-lit llvm/utils/lit third-party
+          LLVM=$(brew --prefix llvm)
+          cmake -S /tmp/llvm-project/runtimes -B /tmp/omp-build -DLLVM_ENABLE_RUNTIMES=openmp -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/tmp/omp14 -DCMAKE_C_COMPILER="$LLVM/bin/clang" -DCMAKE_CXX_COMPILER="$LLVM/bin/clang++" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DLIBOMP_ENABLE_SHARED=OFF -DOPENMP_ENABLE_LIBOMPTARGET=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DOPENMP_INCLUDE_TESTS=OFF
+          cmake --build /tmp/omp-build -j "$(sysctl -n hw.ncpu)"
+          cmake --install /tmp/omp-build
+          otool -l /tmp/omp14/lib/libomp.a | grep -A4 LC_BUILD_VERSION | grep -q "minos 14.0"
+          echo "OMP_PREFIX=/tmp/omp14" >> "$GITHUB_ENV"
       - name: SQLite sources
         run: |
           for u in "$SQLITE_ZIP" "$SQLITE_OLD_ZIP"; do curl -fsSL -o /tmp/s.zip "$u" && unzip -q -o /tmp/s.zip -d /tmp; done
@@ -93,6 +108,10 @@ jobs:
           cd /tmp && /tmp/venv/bin/python /tmp/smoke.py
       - name: Artifacts
         run: |
+          for f in sqlite/tessera.dylib spark/libtessera_jni.dylib; do
+            otool -l $f | grep -A4 LC_BUILD_VERSION | grep -q "minos 14.0"
+            if otool -L $f | grep -q /opt/homebrew; then exit 1; fi
+          done
           V=$(sed -n 's/.*kVersion = "\(.*\)";/\1/p' core/tessera.hpp)
           N=tessera-sqlite-$V-darwin-arm64
           mkdir -p /tmp/$N native/darwin-aarch64
