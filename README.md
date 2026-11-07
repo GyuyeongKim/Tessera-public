@@ -289,9 +289,10 @@ Tessera uses DuckDB's `threads`, and output beyond `memory_limit` goes to `temp_
 A pandas DataFrame or a Parquet or CSV file has no distinct counts, so the planner reads about 262,144 rows of each input
 and counts the joined rows itself. It reads a little of every row group of a local Parquet file and of every part of a
 DataFrame, so a file sorted by another column is measured like any other. It reads from the start where it cannot skip
-ahead: CSV files, remote files, inputs with a pushed filter, and several files without `parquet_metadata_cache`; a join
-that looks small there stays with DuckDB, with the same result. Arrow readers are read once only, so Arrow tables and
-Polars frames stay with DuckDB unless `tessera_min_expansion_cross` is set to `0`.
+ahead: CSV files, remote files, a Parquet file with three quarters of its rows in one row group, inputs with a pushed
+filter, and several files without `parquet_metadata_cache`; a join that looks small there stays with DuckDB, with the
+same result. Arrow readers are read once only, so Arrow tables and Polars frames stay with DuckDB unless
+`tessera_min_expansion_cross` is set to `0`.
 
 ```sql
 SELECT * FROM tessera_sim('t', 'k', 'x', 'jaccard', 0.5);

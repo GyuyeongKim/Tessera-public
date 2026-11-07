@@ -89,17 +89,35 @@ FORMS
 } > "$W/forms.sql"
 "$SPARK_HOME/bin/spark-sql" --master 'local[*]' --driver-memory "${SPARK_DRIVER_MEMORY:-8g}" --jars "$D/tessera-spark.jar" \
   --conf spark.sql.extensions=tessera.spark.TesseraExtensions -f "$W/forms.sql" > "$W/forms.out" 2> "$W/forms.err"
-while IFS=$'\t' read -r name hit on off; do
-  if [ "$hit" -gt 0 ] && [ -n "$on" ] && [ "$on" = "$off" ]; then
+rc=$?
+want_of() {
+  case $1 in
+    having) echo ", prune below 5)" ;;
+    top_k) echo ", top 10)" ;;
+    rank_per_group) echo ", rank 3)" ;;
+    row_number_per_group) echo ", rank 5)" ;;
+  esac
+}
+nforms=$(grep -c "^SELECT 'F|" "$W/forms.sql")
+seen=0
+while IFS=$'\t' read -r name hit on off plan; do
+  seen=$((seen + 1))
+  want=$(want_of "$name")
+  if [ "$hit" -gt 0 ] && [ -n "$on" ] && [ "$on" = "$off" ] && { [ -z "$want" ] || [[ "$plan" == *"$want"* ]]; }; then
     echo "ok   $name"
   else
-    echo "FAIL $name: tessera=($on) engine=($off) plan=$hit"
+    echo "FAIL $name: tessera=($on) engine=($off) plan=$hit${want:+, wanted \"$want\" in the plan}"
     fails=$((fails + 1))
   fi
-done < <(awk -F'\t' '/^F\|/ { name = substr($0, 3); hit[name] = 0; order[++n] = name; next }
-  /TesseraExec|TesseraCrossExec/ { hit[name]++ }
+done < <(awk -F'\t' '/^F\|/ { name = substr($0, 3); hit[name] = 0; plan[name] = ""; order[++n] = name; next }
+  /TesseraExec|TesseraCrossExec/ { hit[name]++; line = $0; gsub(/\t/, " ", line); plan[name] = plan[name] " " line }
   $1 == "on" { s = $2; for (i = 3; i <= NF; i++) s = s "," $i; on[name] = s }
   $1 == "off" { s = $2; for (i = 3; i <= NF; i++) s = s "," $i; off[name] = s }
-  END { for (i = 1; i <= n; i++) { m = order[i]; print m "\t" hit[m] "\t" on[m] "\t" off[m] } }' "$W/forms.out")
+  END { for (i = 1; i <= n; i++) { m = order[i]; print m "\t" hit[m] "\t" on[m] "\t" off[m] "\t" plan[m] } }' "$W/forms.out")
+if [ "$rc" != 0 ] || [ "$seen" != "$nforms" ]; then
+  echo "FAIL spark-sql forms: exit $rc, $seen of $nforms forms ran"
+  tail -20 "$W/forms.err"
+  fails=$((fails + 1))
+fi
 [ $fails = 0 ] && echo "all passed" || echo "$fails failed"
 [ $fails = 0 ]

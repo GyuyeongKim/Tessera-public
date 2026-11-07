@@ -585,6 +585,9 @@ static bool ThrowsOnCell(const Expression &e) {
 		    name.StartsWith("__internal_decompress_integral_")) {
 			return false;
 		}
+		if (f.Function().GetErrorMode() == FunctionErrors::CAN_THROW_RUNTIME_ERROR || f.Function().HasBindLambdaCallback()) {
+			return true;
+		}
 	}
 	return e.CanThrow() && !kids_duck;
 }
