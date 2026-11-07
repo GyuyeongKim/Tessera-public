@@ -25,12 +25,15 @@ INSERT INTO s SELECT (random() * 2000)::int, floor(power(random(), 2) * 300)::in
   FROM generate_series(1, 30000);
 CREATE TABLE u AS SELECT DISTINCT k, x FROM r;
 ALTER TABLE u ALTER COLUMN k SET NOT NULL, ALTER COLUMN x SET NOT NULL;
+CREATE TABLE rn (k int NOT NULL, x int NOT NULL, v float8, iv int);
+INSERT INTO rn SELECT k, x, CASE WHEN x % 7 = 3 OR random() < 0.2 THEN NULL ELSE v END,
+                     CASE WHEN random() < 0.2 THEN NULL ELSE v::int END FROM r;
 ANALYZE;
 SQL
 
 fails=0
 check() {
-  local name=$1 pre=$2 q=$3 res plan
+  local name=$1 pre=$2 q=$3 want=${4:-} res plan explain pruned=1
   res=$("${PSQL[@]}" 2>&1 <<SQL
 LOAD 'tessera_pg';
 SET tessera.min_expansion = 0;
@@ -45,12 +48,14 @@ SELECT 'res', (SELECT count(*) FROM t_on), (SELECT count(*) FROM t_off),
        + (SELECT count(*) FROM (SELECT * FROM t_off EXCEPT ALL SELECT * FROM t_on) d);
 SQL
 )
-  plan=$(printf "LOAD 'tessera_pg';\nSET tessera.min_expansion = 0;\nSET tessera.min_expansion_cross = 0;\n%s\nEXPLAIN (COSTS OFF) %s;\n" "$pre" "$q" | "${PSQL[@]}" 2>&1 | grep -c 'Custom Scan (Tessera)')
+  explain=$(printf "LOAD 'tessera_pg';\nSET tessera.min_expansion = 0;\nSET tessera.min_expansion_cross = 0;\n%s\nEXPLAIN (COSTS OFF) %s;\n" "$pre" "$q" | "${PSQL[@]}" 2>&1)
+  plan=$(grep -c 'Custom Scan (Tessera)' <<< "$explain")
+  [ -z "$want" ] || grep -qF "$want" <<< "$explain" || pruned=0
   IFS=, read -r _ non noff nd <<< "$(grep '^res,' <<< "$res")"
-  if [ -n "${non:-}" ] && [ "$non" = "$noff" ] && [ "$nd" = 0 ] && [ "$non" -gt 0 ] && [ "$plan" -gt 0 ]; then
+  if [ -n "${non:-}" ] && [ "$non" = "$noff" ] && [ "$nd" = 0 ] && [ "$non" -gt 0 ] && [ "$plan" -gt 0 ] && [ "$pruned" = 1 ]; then
     echo "ok   $name"
   else
-    echo "FAIL $name: plan=$plan $(tr '\n' ' ' <<< "$res" | cut -c1-200)"
+    echo "FAIL $name: plan=$plan pruned=$pruned $(tr '\n' ' ' <<< "$res" | cut -c1-200)"
     fails=$((fails + 1))
   fi
 }
@@ -60,7 +65,7 @@ check count "" "SELECT a.x i, b.x j, COUNT(*) s $SELF GROUP BY a.x, b.x"
 check lt "" "SELECT a.x i, b.x j, COUNT(*) s $SELF AND a.x < b.x GROUP BY a.x, b.x"
 check le_sum "" "SELECT a.x i, b.x j, SUM(a.v * b.v) s $SELF AND a.x <= b.x GROUP BY a.x, b.x"
 check gt_sum "" "SELECT a.x i, b.x j, SUM(a.v * b.v) s $SELF AND a.x > b.x GROUP BY a.x, b.x"
-check having "" "SELECT a.x i, b.x j, COUNT(*) s $SELF AND a.x < b.x GROUP BY a.x, b.x HAVING COUNT(*) >= 20"
+check having "" "SELECT a.x i, b.x j, COUNT(*) s $SELF AND a.x < b.x GROUP BY a.x, b.x HAVING COUNT(*) >= 20" "Tessera HAVING prune below: 20"
 check strings "" "SELECT a.xs i, b.xs j, COUNT(*) s FROM r a, r b WHERE a.ks = b.ks AND a.xs < b.xs GROUP BY a.xs, b.xs"
 check wide "" "SELECT a.xw i, b.xw j, COUNT(*) s FROM r a, r b WHERE a.kw = b.kw GROUP BY a.xw, b.xw"
 check frontier_count "SET tessera.frontier = 512;" "SELECT a.x i, b.x j, COUNT(*) s $SELF GROUP BY a.x, b.x"
@@ -84,8 +89,16 @@ check group_three "" "SELECT a.x % 3 c, a.x i, b.y j, COUNT(*) s FROM r a, s b W
 check null_groups "" "SELECT a.xn i, b.xn j, COUNT(*) s $SELF GROUP BY a.xn, b.xn"
 check null_distinct_from "" "SELECT a.xn i, b.xn j, COUNT(*) s $SELF AND a.xn IS DISTINCT FROM b.xn GROUP BY a.xn, b.xn"
 check filters "" "SELECT a.x i, b.y j, SUM(a.v * b.w) s FROM r a, s b WHERE a.k = b.k AND a.v > 2 AND b.w < 3 GROUP BY a.x, b.y"
+check rank_per_group "" "SELECT i, j, s FROM (SELECT a.x i, b.x j, COUNT(*) s, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) rn $SELF GROUP BY a.x, b.x) q WHERE rn <= 3" "Tessera rank prune: 3"
+check row_number_per_group "" "SELECT i, j, s FROM (SELECT a.x i, b.x j, COUNT(*) s, ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC, b.x) rn $SELF GROUP BY a.x, b.x) q WHERE rn <= 5" "Tessera rank prune: 5"
+check cosine "" "SELECT a.x i, b.x j, SUM(a.v * b.v) / (sqrt(SUM(a.v * a.v)) * sqrt(SUM(b.v * b.v))) s $SELF GROUP BY a.x, b.x"
 check subquery_input "" "SELECT a.x i, b.y j, COUNT(*) s FROM (SELECT * FROM r WHERE x < 300) a JOIN s b ON a.k = b.k
   GROUP BY a.x, b.y"
+NSELF="FROM rn a, rn b WHERE a.k = b.k"
+check null_sum "" "SELECT a.x i, b.x j, SUM(a.v * b.v) s $NSELF GROUP BY a.x, b.x"
+check null_cosine "" "SELECT a.x i, b.x j, SUM(a.v * b.v) / (sqrt(SUM(a.v * a.v)) * sqrt(SUM(b.v * b.v))) s $NSELF GROUP BY a.x, b.x"
+check null_count_avg "" "SELECT a.x i, b.x j, COUNT(a.v) c, AVG(a.iv * b.iv) s $NSELF GROUP BY a.x, b.x"
+check null_integers "" "SELECT a.x i, b.x j, SUM(a.iv * b.iv) s $NSELF AND a.x < b.x GROUP BY a.x, b.x"
 
 sim() {
   local name=$1 measure=$2 t=$3 formula=$4 res

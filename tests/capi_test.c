@@ -6,6 +6,7 @@
 #include "tessera_c.h"
 
 static int fails = 0;
+static volatile double zero_double = 0.0;
 #define CHECK(c, ...)                                   \
   do {                                                  \
     if (!(c)) {                                         \
@@ -680,6 +681,426 @@ static void test_cancel(int at) {
   free(x);
 }
 
+static int filter_none(void *ctx, int64_t a, int64_t b) {
+  (void)ctx; (void)a; (void)b;
+  return 0;
+}
+
+static int run_float(tessera_query_c *q, int mode, int64_t topk) {
+  char err[256];
+  const int rc = tessera_c_run(q, mode, 1, 0, topk, 2, -1, 0, err, sizeof err);
+  if (rc != TESSERA_C_OK) {
+    fprintf(stderr, "FAIL: float values: run failed: %s\n", err);
+    fails++;
+  }
+  return tessera_c_float_errors(q);
+}
+
+static size_t rows_of(tessera_query_c *q, int64_t *a, int64_t *b, double *v, size_t cap) {
+  int64_t vi[64];
+  double vd[64];
+  size_t n = tessera_c_next_batch(q, a, b, vi, vd, cap < 64 ? cap : 64);
+  for (size_t i = 0; i < n; i++) v[i] = tessera_c_general(q) ? vd[i] : (double)vi[i];
+  return n;
+}
+
+static double cell_of(const int64_t *a, const int64_t *b, const double *v, size_t n, int64_t x, int64_t y) {
+  for (size_t i = 0; i < n; i++)
+    if (a[i] == x && b[i] == y) return v[i];
+  return -12345;
+}
+
+static void test_float_values(void) {
+  int64_t a[64], b[64];
+  double v[64];
+  const double inf = 1.0 / zero_double, nan_v = inf - inf;
+  {
+    int64_t rk[] = {1, 2, 3}, rx[] = {1, 2, 3}, sk[] = {1, 2, 3}, sy[] = {1, 1, 1};
+    double rv[] = {5, -1e308, 1}, sv[] = {5, 10, 1};
+    tessera_query_c *q = tessera_c_new_cross(1);
+    tessera_c_add(q, rk, rx, rv, 3);
+    tessera_c_add_y(q, sk, sy, sv, 3);
+    tessera_c_set_float_errors(q, 1);
+    CHECK(run_float(q, 0, 1) == 1, "float values: the low cell's overflow is not reported");
+    tessera_c_free(q);
+    q = tessera_c_new_cross(1);
+    tessera_c_add(q, rk, rx, rv, 3);
+    tessera_c_add_y(q, sk, sy, sv, 3);
+    CHECK(run_float(q, 0, 1) == 0, "float values: errors reported without being asked for");
+    tessera_c_free(q);
+  }
+  {
+    int64_t rk[] = {1, 2}, rx[] = {1, 1}, sk[] = {1, 2}, sy[] = {1, 2};
+    double rv[] = {1e-200, 1}, sv[] = {1e-200, 1};
+    for (int drop = 0; drop < 2; drop++) {
+      tessera_query_c *q = tessera_c_new_cross(1);
+      tessera_c_add(q, rk, rx, rv, 2);
+      tessera_c_add_y(q, sk, sy, sv, 2);
+      tessera_c_set_float_errors(q, 1);
+      if (drop) tessera_c_set_pair_filter(q, filter_none, NULL, 64);
+      const int e = run_float(q, 0, -1);
+      CHECK(e == (drop ? 0 : 2), "float values: underflow reported as %d with the filter %d", e, drop);
+      tessera_c_free(q);
+    }
+  }
+  {
+    int64_t rk[] = {1, 2, 3}, rx[] = {1, 1, 2}, sk[] = {1, 2, 3}, sy[] = {1, 1, 1};
+    double rv[] = {1.3e154, 1.3e154, inf}, sv[] = {1.3e154, 1.3e154, 1};
+    for (int drop = 0; drop < 2; drop++) {
+      tessera_query_c *q = tessera_c_new_cross(1);
+      tessera_c_add(q, rk, rx, rv, 3);
+      tessera_c_add_y(q, sk, sy, sv, 3);
+      tessera_c_set_float_errors(q, 1);
+      if (drop) tessera_c_set_pair_filter(q, filter_none, NULL, 64);
+      const int e = run_float(q, 0, -1);
+      CHECK(e == (drop ? 0 : 1), "float values: a partial sum's overflow reported as %d with the filter %d", e, drop);
+      tessera_c_free(q);
+    }
+  }
+  {
+    int64_t rk[] = {1, 2}, rx[] = {1, 1}, sk[] = {1, 2}, sy[] = {1, 1};
+    double rv[] = {2e77, -2e77}, same[] = {2e77, 2e77}, sv[] = {2e77, 2e77};
+    for (int accum = 0; accum < 2; accum++) {
+      for (int equal = 0; equal < 2; equal++) {
+        tessera_query_c *q = tessera_c_new_cross(1);
+        tessera_c_add(q, rk, rx, equal ? same : rv, 2);
+        tessera_c_add_y(q, sk, sy, sv, 2);
+        tessera_c_set_float_errors(q, 1);
+        tessera_c_set_float_accum(q, accum);
+        const int e = run_float(q, 0, -1);
+        CHECK(e == (accum && !equal ? 1 : 0), "float values: accumulating %d, equal products %d, reported %d", accum, equal, e);
+        if (e == 0) {
+          const size_t n = rows_of(q, a, b, v, 64);
+          CHECK(cell_of(a, b, v, n, 1, 1) == (equal ? 2 * (2e77 * 2e77) : 0), "float values: accumulating %d, equal products %d, wrong sum", accum, equal);
+        }
+        tessera_c_free(q);
+      }
+    }
+  }
+  {
+    int64_t rk[] = {1, 1, 1, 2, 2}, rx[] = {1, 2, 3, 1, 2};
+    double rv[] = {1.5, 2.5, 0.5, 1.5, 2.5};
+    tessera_query_c *q = tessera_c_new(1);
+    tessera_c_add(q, rk, rx, rv, 5);
+    tessera_c_set_float_errors(q, 1);
+    tessera_c_set_float_accum(q, 1);
+    CHECK(run_float(q, 1, 1) == 0, "float values: an accumulation error on ordinary values");
+    CHECK(rows_of(q, a, b, v, 64) == 1, "float values: the top-k did not prune with accumulation on");
+    tessera_c_free(q);
+  }
+  {
+    int64_t rk[] = {1, 1, 1, 2, 2}, rx[] = {1, 2, 3, 1, 2};
+    double rv[] = {1.5, 2.5, 0.5, 1.5, 2.5};
+    tessera_query_c *q = tessera_c_new(1);
+    tessera_c_add(q, rk, rx, rv, 5);
+    tessera_c_set_float_errors(q, 1);
+    CHECK(run_float(q, 1, 1) == 0, "float values: an error on ordinary values");
+    CHECK(rows_of(q, a, b, v, 64) == 1, "float values: the top-k did not prune ordinary values");
+    tessera_c_free(q);
+  }
+  {
+    int64_t rk[] = {1, 1, 1}, rx[] = {1, 2, 2};
+    double rv[] = {inf, 3, -7};
+    for (int mode = 0; mode < 4; mode++) {
+      tessera_query_c *q = tessera_c_new(1);
+      tessera_c_add(q, rk, rx, rv, 3);
+      CHECK(run_float(q, mode, -1) == 0, "float values: repeated rows, mode %d", mode);
+      const size_t n = rows_of(q, a, b, v, 64);
+      const double c = cell_of(a, b, v, n, 1, 2);
+      CHECK(c != c, "float values: repeated Infinity in mode %d gives %g, not NaN", mode, c);
+      tessera_c_free(q);
+    }
+    int64_t sk[] = {1, 1}, sy[] = {1, 1};
+    double sv[] = {3, -7}, xv[] = {inf};
+    tessera_query_c *q = tessera_c_new_cross(1);
+    tessera_c_add(q, rk, rx, xv, 1);
+    tessera_c_add_y(q, sk, sy, sv, 2);
+    run_float(q, 0, -1);
+    size_t n = rows_of(q, a, b, v, 64);
+    CHECK(n == 1 && v[0] != v[0], "float values: repeated rows of the cross product");
+    tessera_c_free(q);
+  }
+  {
+    int64_t rk[] = {1, 2}, rx[] = {1, 1}, sk[] = {1, 2}, sy[] = {1, 1};
+    double rv[] = {1e308, 1e154}, sv[] = {-1e308, 1e308};
+    tessera_query_c *q = tessera_c_new_cross(1);
+    tessera_c_add(q, rk, rx, rv, 2);
+    tessera_c_add_y(q, sk, sy, sv, 2);
+    run_float(q, 0, -1);
+    size_t n = rows_of(q, a, b, v, 64);
+    CHECK(n == 1 && v[0] != v[0], "float values: opposite overflowing products give %g", n ? v[0] : 0.0);
+    tessera_c_free(q);
+  }
+  {
+    int64_t rk[] = {1, 1, 1, 2, 2}, rx[] = {1, 2, 3, 1, 2}, rv[] = {5, 5, 1, 5, 5};
+    for (int reach = 0; reach < 2; reach++) {
+      tessera_query_c *q = tessera_c_new(1);
+      tessera_c_add_i64(q, rk, rx, rv, 5);
+      tessera_c_set_sum_limit(q, reach ? 10 : 1e12);
+      run_float(q, 1, 1);
+      const size_t n = rows_of(q, a, b, v, 64);
+      CHECK(reach ? n == 3 : n == 1, "float values: %zu rows with the sum limit %s", n, reach ? "reached" : "far");
+      tessera_c_free(q);
+    }
+  }
+  {
+    union { uint64_t u; double d; } under, over;
+    under.u = TESSERA_C_ROW_VALUE_UNDERFLOW;
+    over.u = TESSERA_C_ROW_VALUE_OVERFLOW;
+    int64_t rk[] = {1, 2}, rx[] = {1, 2}, sk[] = {1, 2}, sy[] = {1, 2};
+    const double cases[][4] = {{under.d, 1, 1, 1}, {over.d, 1, 1, 1}, {1e308, 1, 10, 1}, {1e-200, 1, 1e-200, 1}, {2, 3, 4, 5}};
+    const int want[] = {2, 1, 1, 2, 0};
+    for (int c = 0; c < 5; c++) {
+      tessera_query_c *q = tessera_c_new_cross(0);
+      tessera_c_set_many(q, 1, 0);
+      tessera_c_set_float_errors(q, 1);
+      tessera_c_add_many(q, 0, rk, rx, cases[c], 2);
+      tessera_c_add_many(q, 1, sk, sy, cases[c] + 2, 2);
+      const int e = run_float(q, 0, -1);
+      CHECK(e == want[c], "float values: several sums, case %d: %d", c, e);
+      tessera_c_free(q);
+    }
+    int64_t alone[] = {9, 2};
+    const double marked[] = {under.d, 1}, other[] = {1, 1};
+    tessera_query_c *q = tessera_c_new_cross(0);
+    tessera_c_set_many(q, 1, 0);
+    tessera_c_set_float_errors(q, 1);
+    tessera_c_add_many(q, 0, alone, rx, marked, 2);
+    tessera_c_add_many(q, 1, sk, sy, other, 2);
+    CHECK(run_float(q, 0, -1) == 0, "float values: a marked row that joins nothing was reported");
+    tessera_c_free(q);
+  }
+}
+
+static void test_null_sums(int pair_op, int threads) {
+  enum { NR = 3000, NS = 2000, NK = 200, NX = 40, NY = 30, M = 4 };
+  static int64_t rk[NR], rx[NR], ri[NR], sk[NS], sy[NS], sj[NS];
+  static double rv[NR], sw[NS];
+  static uint64_t rn[NR], sn[NS];
+  static double rd[NR * M], sd[NS * M];
+  static int64_t rdi[NR * M], sdi[NS * M];
+  for (int r = 0; r < NR; r++) {
+    rk[r] = (int64_t)(next_u64() % NK);
+    rx[r] = (int64_t)(next_u64() % NX);
+    if (r < 1000 && rx[r] == 7) rx[r] = 8;
+    rv[r] = (double)((int)(next_u64() % 9) - 3);
+    ri[r] = (int64_t)(next_u64() % 4294967296ull) - 2147483648ll;
+    const int vnull = r >= 1000 && next_u64() % 3 == 0, inull = r >= 1000 && next_u64() % 4 == 0;
+    rn[r] = (vnull ? 1u | 4u | 8u : 0u) | (inull ? 2u : 0u);
+    if (rx[r] == 7) rn[r] |= 1u | 4u | 8u;
+  }
+  for (int r = 0; r < NS; r++) {
+    sk[r] = (int64_t)(next_u64() % NK);
+    sy[r] = (int64_t)(next_u64() % NY);
+    if (r >= 1500 && sy[r] == 5) sy[r] = 6;
+    sw[r] = (double)(1 + (int)(next_u64() % 4));
+    sj[r] = (int64_t)(next_u64() % 4294967296ull) - 2147483648ll;
+    const int wnull = r < 1500 && next_u64() % 3 == 0, jnull = r < 1500 && next_u64() % 5 == 0;
+    sn[r] = (wnull ? 1u | 8u : 0u) | (jnull ? 2u : 0u);
+    if (sy[r] == 5) sn[r] |= 2u;
+  }
+  for (int r = 0; r < NR; r++) {
+    rd[r * M + 0] = rn[r] & 1 ? 0 : rv[r];
+    rdi[r * M + 1] = rn[r] & 2 ? 0 : ri[r];
+    rd[r * M + 2] = rn[r] & 4 ? 0 : rv[r];
+    rd[r * M + 3] = 1;
+  }
+  for (int r = 0; r < NS; r++) {
+    sd[r * M + 0] = sn[r] & 1 ? 0 : sw[r];
+    sdi[r * M + 1] = sn[r] & 2 ? 0 : sj[r];
+    sd[r * M + 2] = 1;
+    sd[r * M + 3] = 1;
+  }
+  static int64_t cnt[NX][NY], vcnt[NX][NY][M];
+  static double dsum[NX][NY][M];
+  static __int128 isum[NX][NY];
+  __int128 pmin = 0, pmax = 0, cmin = 0, cmax = 0;
+  int have_p = 0, have_c = 0;
+  memset(cnt, 0, sizeof cnt);
+  memset(vcnt, 0, sizeof vcnt);
+  memset(dsum, 0, sizeof dsum);
+  memset(isum, 0, sizeof isum);
+  for (int a = 0; a < NR; a++) {
+    for (int b = 0; b < NS; b++) {
+      if (rk[a] != sk[b]) continue;
+      const int64_t xv = rx[a], yv = sy[b];
+      const int pass = pair_op == 0 ? 1 : pair_op == 1 ? xv < yv : pair_op == 2 ? xv <= yv : pair_op == 3 ? xv > yv
+                       : pair_op == 4 ? xv >= yv : xv != yv;
+      if (!pass) continue;
+      cnt[xv][yv]++;
+      const uint64_t skip = rn[a] | sn[b];
+      for (int m = 0; m < M; m++) {
+        if (skip >> m & 1) continue;
+        vcnt[xv][yv][m]++;
+        if (m == 1) {
+          const __int128 pr = (__int128)ri[a] * sj[b];
+          isum[xv][yv] += pr;
+          if (!have_p || pr < pmin) pmin = pr;
+          if (!have_p || pr > pmax) pmax = pr;
+          have_p = 1;
+        } else {
+          dsum[xv][yv][m] += rd[a * M + m] * sd[b * M + m];
+        }
+      }
+    }
+  }
+  int ref_cells = 0;
+  for (int x = 0; x < NX; x++) {
+    for (int y = 0; y < NY; y++) {
+      if (cnt[x][y]) ref_cells++;
+      if (cnt[x][y] && vcnt[x][y][1]) {
+        if (!have_c || isum[x][y] < cmin) cmin = isum[x][y];
+        if (!have_c || isum[x][y] > cmax) cmax = isum[x][y];
+        have_c = 1;
+      }
+    }
+  }
+  tessera_query_c *q = tessera_c_new_cross(0);
+  tessera_c_set_many(q, M, pair_op);
+  tessera_c_set_many_int(q, 1, 1);
+  CHECK(tessera_c_add_many(q, 0, rk, rx, rd, 1) == -1, "null sums: tessera_c_add_many took an integer sum");
+  CHECK(tessera_c_add_many2(q, 0, rk, rx, rd, rdi, NULL, 1000) == 0, "null sums: add without marks");
+  CHECK(tessera_c_add_many2(q, 0, rk + 1000, rx + 1000, rd + 1000 * M, rdi + 1000 * M, rn + 1000, NR - 1000) == 0,
+        "null sums: add with marks");
+  CHECK(tessera_c_add_many2(q, 1, sk, sy, sd, sdi, sn, 1500) == 0, "null sums: second input with marks");
+  CHECK(tessera_c_add_many2(q, 1, sk + 1500, sy + 1500, sd + 1500 * M, sdi + 1500 * M, NULL, NS - 1500) == 0,
+        "null sums: second input without marks");
+  char err[256];
+  CHECK(tessera_c_run(q, 0, 1, 0, -1, threads, -1, 0, err, sizeof err) == TESSERA_C_OK, "null sums: run: %s", err);
+  int64_t x0[64], x1[64], count[64], isums[64 * M * 2];
+  double sums[64 * M];
+  uint64_t nulls[64];
+  int got = 0, nulled[M] = {0, 0, 0, 0};
+  size_t n;
+  while ((n = tessera_c_next_many2(q, x0, x1, count, sums, isums, nulls, 64)) > 0) {
+    for (size_t r = 0; r < n; r++) {
+      const int64_t x = x0[r], y = x1[r];
+      CHECK(x >= 0 && x < NX && y >= 0 && y < NY && cnt[x][y] == count[r], "null sums: cell (%lld, %lld) count %lld",
+            (long long)x, (long long)y, (long long)count[r]);
+      for (int m = 0; m < M; m++) {
+        const int is_null = (int)(nulls[r] >> m & 1);
+        CHECK(is_null == (vcnt[x][y][m] == 0), "null sums op %d: cell (%lld, %lld) sum %d NULL %d, valid pairs %lld",
+              pair_op, (long long)x, (long long)y, m, is_null, (long long)vcnt[x][y][m]);
+        nulled[m] += is_null;
+        if (is_null) continue;
+        if (m == 1) {
+          const __int128 v = (__int128)(((unsigned __int128)(uint64_t)isums[2 * (r * M + 1) + 1] << 64) |
+                                        (uint64_t)isums[2 * (r * M + 1)]);
+          CHECK(v == isum[x][y], "null sums: cell (%lld, %lld) integer sum", (long long)x, (long long)y);
+        } else {
+          CHECK(sums[r * M + m] == dsum[x][y][m], "null sums: cell (%lld, %lld) sum %d = %g, want %g", (long long)x,
+                (long long)y, m, sums[r * M + m], dsum[x][y][m]);
+        }
+      }
+      CHECK(sums[r * M + 3] == (double)vcnt[x][y][0], "null sums: divisor of cell (%lld, %lld)", (long long)x,
+            (long long)y);
+      got++;
+    }
+  }
+  CHECK(got == ref_cells, "null sums op %d: %d cells, want %d", pair_op, got, ref_cells);
+  CHECK(pair_op != 0 || (nulled[0] > 0 && nulled[1] > 0 && nulled[2] > 0), "null sums: no NULL cell to check");
+  const int want = (have_p && (pmin < INT64_MIN || pmax > INT64_MAX) ? 1 : 0) |
+                   (have_c && (cmin < INT64_MIN || cmax > INT64_MAX) ? 2 : 0);
+  CHECK(tessera_c_many_overflow(q, 1, 64, 64) == want, "null sums: overflow flags %d, want %d",
+        tessera_c_many_overflow(q, 1, 64, 64), want);
+  CHECK(pair_op != 0 || want == 2, "null sums: the integer sums do not leave 64 bits");
+  tessera_c_free(q);
+}
+
+static void test_null_float_errors(void) {
+  union { uint64_t u; double d; } over;
+  over.u = TESSERA_C_ROW_VALUE_OVERFLOW;
+  int64_t rk[] = {1, 2}, rx[] = {1, 2}, sk[] = {1, 2}, sy[] = {1, 2};
+  for (int c = 0; c < 5; c++) {
+    const double rv[] = {c < 3 ? over.d : 1e200, 1}, sv[] = {c < 3 ? 1 : 1e200, 1};
+    const uint64_t rnull[] = {c == 1 ? 1u : 0u, 0}, snull[] = {c == 2 || c == 4 ? 1u : 0u, 0};
+    const int want = c == 4 ? 0 : 1;
+    tessera_query_c *q = tessera_c_new_cross(0);
+    tessera_c_set_many(q, 1, 0);
+    tessera_c_set_float_errors(q, 1);
+    tessera_c_add_many2(q, 0, rk, rx, rv, NULL, rnull, 2);
+    tessera_c_add_many2(q, 1, sk, sy, sv, NULL, snull, 2);
+    char err[256];
+    CHECK(tessera_c_run(q, 0, 1, 0, -1, 2, -1, 0, err, sizeof err) == TESSERA_C_OK, "null float errors: %s", err);
+    CHECK(tessera_c_float_errors(q) == want, "null float errors: case %d reported %d", c, tessera_c_float_errors(q));
+    int64_t x0[4], x1[4], count[4];
+    double sums[4];
+    uint64_t nulls[4];
+    size_t n = tessera_c_next_many2(q, x0, x1, count, sums, NULL, nulls, 4);
+    int nulled = 0;
+    for (size_t r = 0; r < n; r++) nulled += x0[r] == 1 && nulls[r] == 1;
+    CHECK(n == 2 && nulled == (c == 1 || c == 2 || c == 4 ? 1 : 0), "null float errors: case %d: %zu rows, %d NULL", c, n,
+          nulled);
+    tessera_c_free(q);
+  }
+}
+
+static void test_many_edges(void) {
+  enum { M = 64, M2 = 65 };
+  {
+    int64_t rk[] = {1, 1, 1}, rx[] = {1, 1, 2}, sk[] = {1}, sy[] = {1};
+    static double rv[3 * M], sv[M];
+    for (int i = 0; i < 3 * M; i++) rv[i] = 1;
+    for (int i = 0; i < M; i++) sv[i] = 2;
+    const uint64_t rn[] = {1ull << 63, 0, 1ull << 63}, sn[] = {0};
+    tessera_query_c *q = tessera_c_new_cross(0);
+    tessera_c_set_many(q, M, 0);
+    CHECK(tessera_c_add_many2(q, 0, rk, rx, rv, NULL, rn, 3) == 0 && tessera_c_add_many2(q, 1, sk, sy, sv, NULL, sn, 1) == 0,
+          "many edges: add with 64 sums");
+    char err[256];
+    CHECK(tessera_c_run(q, 0, 1, 0, -1, 2, -1, 0, err, sizeof err) == TESSERA_C_OK, "many edges: 64 sums: %s", err);
+    int64_t x0[4], x1[4], c[4];
+    static double sums[4 * M];
+    uint64_t nl[4];
+    const size_t n = tessera_c_next_many2(q, x0, x1, c, sums, NULL, nl, 4);
+    int good = n == 2;
+    for (size_t r = 0; r < n && good; r++) {
+      const int one = x0[r] == 1;
+      good = c[r] == (one ? 2 : 1) && sums[r * M] == (one ? 4 : 2) && sums[r * M + 63] == (one ? 2 : 0) &&
+             nl[r] == (one ? 0 : 1ull << 63);
+    }
+    CHECK(good, "many edges: NULL marks on sum 63");
+    tessera_c_free(q);
+  }
+  {
+    int64_t rk[] = {1}, rx[] = {1}, sk[] = {1}, sy[] = {1};
+    static double rv[M2], sv[M2];
+    for (int i = 0; i < M2; i++) rv[i] = i, sv[i] = 1;
+    tessera_query_c *q = tessera_c_new_cross(0);
+    tessera_c_set_many(q, M2, 0);
+    tessera_c_add_many(q, 0, rk, rx, rv, 1);
+    tessera_c_add_many(q, 1, sk, sy, sv, 1);
+    char err[256];
+    CHECK(tessera_c_run(q, 0, 1, 0, -1, 1, -1, 0, err, sizeof err) == TESSERA_C_OK, "many edges: 65 sums: %s", err);
+    int64_t x0[2], x1[2], c[2];
+    static double sums[2 * M2];
+    const size_t n = tessera_c_next_many(q, x0, x1, c, sums, 2);
+    CHECK(n == 1 && sums[64] == 64, "many edges: 65 sums without marks");
+    tessera_c_free(q);
+  }
+  {
+    int64_t rk[] = {1, 1}, rx[] = {1, 2}, sk[] = {1}, sy[] = {1};
+    const double rv[] = {3, 4};
+    const int64_t sv[] = {5};
+    tessera_query_c *q = tessera_c_new_cross(0);
+    tessera_c_set_many(q, 1, 0);
+    CHECK(tessera_c_add_many2(q, 0, rk, rx, rv, NULL, NULL, 2) == 0, "many edges: first batch");
+    tessera_c_set_many_int(q, 0, 1);
+    CHECK(tessera_c_add_many2(q, 1, sk, sy, NULL, sv, NULL, 1) == -1, "many edges: set_many_int after rows took effect");
+    char err[256];
+    CHECK(tessera_c_run(q, 0, 1, 0, -1, 1, -1, 0, err, sizeof err) == TESSERA_C_OK, "many edges: run after a refused batch: %s",
+          err);
+    tessera_c_free(q);
+  }
+  {
+    int64_t k[1] = {0}, x[1] = {0};
+    tessera_query_c *q = tessera_c_new_cross(0);
+    tessera_c_set_many(q, 2, 0);
+    CHECK(tessera_c_add_many(q, 0, k, x, NULL, 0) == 0, "many edges: an empty batch without values");
+    tessera_c_free(q);
+  }
+}
+
 int main(void) {
   printf("tessera %s, API %d (header %d), core variant %s\n", tessera_c_version(), tessera_c_api_version(),
          TESSERA_API_VERSION, tessera_c_isa());
@@ -742,6 +1163,10 @@ int main(void) {
       test_similarity_nested(measure, 0.3, mode, -1);
       test_similarity_nested(measure, 0.7, mode, 64);
     }
+  test_float_values();
+  for (int op = 0; op <= 5; op++) test_null_sums(op, op == 0 ? 1 : 4);
+  test_null_float_errors();
+  test_many_edges();
   printf("%s (%d failures)\n", fails ? "FAILED" : "all passed", fails);
   return fails ? 1 : 0;
 }

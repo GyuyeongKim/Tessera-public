@@ -27,6 +27,11 @@ void throw_state(JNIEnv *env, const char *what) {
   if (c) env->ThrowNew(c, what);
 }
 
+bool holds(JNIEnv *env, jarray a, long long want, bool optional) {
+  if (!a) return optional;
+  return want >= 0 && (long long)env->GetArrayLength(a) >= want;
+}
+
 struct Pinned {
   JNIEnv *env;
   jarray arr[6];
@@ -246,6 +251,104 @@ JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setSimilarity(JNIEnv *, 
 
 JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setDistinctKeys(JNIEnv *, jclass, jlong h, jboolean on) {
   tessera_c_set_distinct_keys((tessera_query_c *)h, on ? 1 : 0);
+}
+
+JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setGroupTop(JNIEnv *, jclass, jlong h, jlong k, jint of) {
+  tessera_c_set_group_top((tessera_query_c *)h, k, of);
+}
+
+JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setSumLimit(JNIEnv *, jclass, jlong h, jdouble limit) {
+  tessera_c_set_sum_limit((tessera_query_c *)h, limit);
+}
+
+JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setMany(JNIEnv *, jclass, jlong h, jint n, jint pair_op) {
+  tessera_c_set_many((tessera_query_c *)h, (size_t)n, pair_op);
+}
+
+JNIEXPORT jint JNICALL Java_tessera_spark_TesseraNative_addMany(JNIEnv *env, jclass, jlong h, jboolean second, jlongArray k,
+                                                                jlongArray x, jdoubleArray v, jint n) {
+  int rc = -1;
+  {
+    Pinned p(env);
+    jlong *a = (jlong *)p.pin(k, 0), *b = (jlong *)p.pin(x, 0);
+    jdouble *d = (jdouble *)p.pin(v, 0);
+    if (p.ok()) {
+      rc = tessera_c_add_many((tessera_query_c *)h, second ? 1 : 0, (int64_t *)a, (int64_t *)b, (double *)d, (size_t)n);
+    }
+  }
+  return rc;
+}
+
+JNIEXPORT jint JNICALL Java_tessera_spark_TesseraNative_nextMany(JNIEnv *env, jclass, jlong h, jlongArray x0, jlongArray x1,
+                                                                 jlongArray cnt, jdoubleArray v) {
+  const jsize cap = env->GetArrayLength(x0);
+  size_t n = 0;
+  {
+    Pinned p(env);
+    jlong *a = (jlong *)p.pin(x0, 0), *b = (jlong *)p.pin(x1, 0), *c = (jlong *)p.pin(cnt, 0);
+    jdouble *d = (jdouble *)p.pin(v, 0);
+    if (p.ok()) {
+      n = tessera_c_next_many((tessera_query_c *)h, (int64_t *)a, (int64_t *)b, (int64_t *)c, (double *)d, (size_t)cap);
+    }
+  }
+  return (jint)n;
+}
+
+JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setManyInt(JNIEnv *, jclass, jlong h, jint m, jboolean on) {
+  tessera_c_set_many_int((tessera_query_c *)h, (size_t)m, on ? 1 : 0);
+}
+
+JNIEXPORT jint JNICALL Java_tessera_spark_TesseraNative_manyOverflow(JNIEnv *, jclass, jlong h, jint m, jint product_bits,
+                                                                     jint sum_bits) {
+  return tessera_c_many_overflow((const tessera_query_c *)h, (size_t)m, product_bits, sum_bits);
+}
+
+JNIEXPORT jint JNICALL Java_tessera_spark_TesseraNative_addMany2(JNIEnv *env, jclass, jlong h, jboolean second, jlongArray k,
+                                                                 jlongArray x, jdoubleArray v, jlongArray iv, jlongArray nulls,
+                                                                 jint n, jint m) {
+  int rc = -1;
+  const long long nm = (long long)n * m;
+  if (n < 0 || m <= 0 || !holds(env, k, n, false) || !holds(env, x, n, false) || !holds(env, v, nm, true) ||
+      !holds(env, iv, nm, true) || !holds(env, nulls, n, true)) {
+    throw_state(env, "tessera: addMany2 arrays shorter than their rows");
+    return rc;
+  }
+  {
+    Pinned p(env);
+    jlong *a = (jlong *)p.pin(k, 0), *b = (jlong *)p.pin(x, 0);
+    jdouble *d = (jdouble *)p.pin(v, 0);
+    jlong *i = iv ? (jlong *)p.pin(iv, 0) : nullptr;
+    jlong *m = nulls ? (jlong *)p.pin(nulls, 0) : nullptr;
+    if (p.ok()) {
+      rc = tessera_c_add_many2((tessera_query_c *)h, second ? 1 : 0, (int64_t *)a, (int64_t *)b, (double *)d,
+                               (const int64_t *)i, (const uint64_t *)m, (size_t)n);
+    }
+  }
+  return rc;
+}
+
+JNIEXPORT jint JNICALL Java_tessera_spark_TesseraNative_nextMany2(JNIEnv *env, jclass, jlong h, jlongArray x0, jlongArray x1,
+                                                                  jlongArray cnt, jdoubleArray v, jlongArray isums,
+                                                                  jlongArray nulls, jint m) {
+  const jsize cap = env->GetArrayLength(x0);
+  size_t n = 0;
+  if (m <= 0 || !holds(env, x1, cap, false) || !holds(env, cnt, cap, true) || !holds(env, v, (long long)cap * m, true) ||
+      !holds(env, isums, 2LL * cap * m, true) || !holds(env, nulls, cap, true)) {
+    throw_state(env, "tessera: nextMany2 arrays shorter than their rows");
+    return 0;
+  }
+  {
+    Pinned p(env);
+    jlong *a = (jlong *)p.pin(x0, 0), *b = (jlong *)p.pin(x1, 0), *c = (jlong *)p.pin(cnt, 0);
+    jdouble *d = (jdouble *)p.pin(v, 0);
+    jlong *i = isums ? (jlong *)p.pin(isums, 0) : nullptr;
+    jlong *m = nulls ? (jlong *)p.pin(nulls, 0) : nullptr;
+    if (p.ok()) {
+      n = tessera_c_next_many2((tessera_query_c *)h, (int64_t *)a, (int64_t *)b, (int64_t *)c, (double *)d, (int64_t *)i,
+                               (uint64_t *)m, (size_t)cap);
+    }
+  }
+  return (jint)n;
 }
 
 JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_cancel(JNIEnv *, jclass, jlong h) {

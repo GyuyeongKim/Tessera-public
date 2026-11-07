@@ -13,6 +13,11 @@
 
 ## News
 
+- **[2026/11]** Tessera 1.4.1 sums and counts columns that hold NULLs as SQL does, in DuckDB, PostgreSQL, and Spark, so
+  a cosine over a pandas DataFrame, a CSV file, or Parquet files read by Spark runs in Tessera. It also runs on pandas
+  DataFrames and on Parquet and CSV files at DuckDB's default settings, keeps the top values of each group inside the
+  operator (`RANK() ... <= k`), and computes a cosine or a Pearson correlation in one pass. See
+  [Supported queries](#supported-queries).
 - **[2026/11]** Tessera 1.3.0 runs many more join-aggregate forms: `<>` and `IS DISTINCT FROM` between the two sides,
   `COUNT(DISTINCT k)`, `AVG`, keys and groups of several columns or computed from a column, NULL groups, filters on
   the inputs, and date, timestamp, and decimal columns. PostgreSQL and Spark now prune with `HAVING` and
@@ -101,7 +106,7 @@ linear algebra (54.3 s against 2.9 s on the news articles). Release 1.1.1 reruns
 |---|---|---|
 | SQLite in Python | [`sqlite-tessera`](https://pypi.org/project/sqlite-tessera/) on PyPI | `pip install sqlite-tessera` |
 | SQLite | `tessera-sqlite-<version>-<platform>.tar.gz` on the [releases page](https://github.com/GyuyeongKim/Tessera-public/releases) | `.load ./tessera` in the shell |
-| Spark | `io.github.gyuyeongkim:tessera-spark_2.13` on Maven Central | `--packages io.github.gyuyeongkim:tessera-spark_2.13:1.3.0` |
+| Spark | `io.github.gyuyeongkim:tessera-spark_2.13` on Maven Central | `--packages io.github.gyuyeongkim:tessera-spark_2.13:1.4.1` |
 | PostgreSQL | [`tessera_pg`](https://pgxn.org/dist/tessera_pg/) on PGXN | `pgxn install tessera_pg` |
 | DuckDB | [`tessera`](https://duckdb.org/community_extensions/extensions/tessera.html) in the community extensions | `INSTALL tessera FROM community; LOAD tessera;` |
 
@@ -169,7 +174,7 @@ one portable build of the sparse path.
 
 - Self-joins and joins of two relations grouped by columns of both sides:
   `SELECT a.x, b.y, COUNT(*) FROM R a JOIN S b ON a.k = b.k GROUP BY a.x, b.y`.
-- Aggregates: `COUNT(*)`, `COUNT` of a column without NULLs, `COUNT(DISTINCT a.k)`, `SUM(a.v * b.w)`, `SUM(a.v)`,
+- Aggregates: `COUNT(*)`, `COUNT` of a column, `COUNT(DISTINCT a.k)`, `SUM(a.v * b.w)`, `SUM(a.v)`,
   `AVG` of such an argument, and a count, a sum and an average of one argument together.
 - Pair filters between the two sides' group columns: `<`, `<=`, `>`, `>=`, `<>`, and `IS DISTINCT FROM`.
 - Keys of several columns (`a.k = b.k AND a.day = b.day`), and keys computed from one side's columns
@@ -179,10 +184,17 @@ one portable build of the sparse path.
   group.
 - Expressions of the groups and aggregates in the select list (`a.c || '-' || a.x`, `COUNT(*) * 2`), `HAVING`,
   `ORDER BY agg DESC LIMIT n [OFFSET m]`, window functions above the aggregate, and `SELECT DISTINCT a.x, b.x`.
+- The top values of each group, `RANK()` or `ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY agg DESC) <= k`: the window
+  stays above, and the operator keeps only the cells that can reach it. DuckDB, PostgreSQL, and Spark.
+- Several different sums in one query, computed in one pass over the joined rows, such as a cosine
+  (`SUM(a.v * b.v) / (sqrt(SUM(a.v * a.v)) * sqrt(SUM(b.v * b.v)))`) or a Pearson correlation. Floating-point weights in
+  DuckDB, PostgreSQL, and Spark, and integers in DuckDB. Each sum must be a product over one side or a product of one
+  side's and the other's, written left to right.
 - Filters on either side or on both, with different filters on the two sides.
 - Inputs: tables; in PostgreSQL also row-level security, partitioned and inherited tables, subqueries, views, CTEs,
-  set-returning functions, foreign tables and `TABLESAMPLE`; in DuckDB also table functions such as `read_csv`, a
-  subquery's `DISTINCT` or aggregate, and the last join of three relations; in Spark any plan.
+  set-returning functions, foreign tables and `TABLESAMPLE`; in DuckDB also pandas DataFrames, Parquet and CSV files
+  (see [Engines](#engines)), Arrow tables and Polars frames, table functions such as `read_csv`, CTEs, a subquery's
+  `DISTINCT` or aggregate, and the last join of three relations; in Spark any plan.
 - Item similarity (cosine, Jaccard, Dice, overlap) above a threshold.
 
 Keys and groups can be integers, strings, dates and timestamps, and, held as their text, decimals, booleans and in
@@ -199,7 +211,7 @@ DuckDB, PostgreSQL, and Spark recognize:
   in either order;
 - the pair filter (`a.x < b.x`, `b.x > a.x`, `<=`, `>`, `>=`, `<>`, `!=`, `IS DISTINCT FROM`) in `ON` or in `WHERE`;
 - `GROUP BY` in either order or by position, and the select list in any order;
-- `COUNT(*)`, `COUNT(1)`, `COUNT` of a column without NULLs, `COUNT(DISTINCT a.k)`, `SUM(a.v * b.v)` in either
+- `COUNT(*)`, `COUNT(1)`, `COUNT` of a column, `COUNT(DISTINCT a.k)`, `SUM(a.v * b.v)` in either
   order, and `AVG`;
 - `HAVING` over the aggregates and the group columns (`agg >= c` and `agg > c` on a count or a single sum also
   prune), and `ORDER BY` the aggregate, its alias, or its position with `DESC LIMIT n [OFFSET m]`;
@@ -209,15 +221,22 @@ These run as the engine's own plan, with the same result:
 
 - `MIN` and `MAX`, which need another semiring than the matrix engine's multiply and add, outer joins, and a third
   relation outside DuckDB's last join;
+- in DuckDB, sums that each read one side and no product across the two (`SUM(a.v), SUM(b.v)`), which DuckDB computes
+  below the join;
 - nondeterministic collations, whose equality is not equality of bytes;
 - in PostgreSQL and Spark, `SUM` of `real` / `float` products, which those engines sum in float32.
 
-NULLs: group columns may hold NULLs. A summed column must hold none: an adapter leaves a query to the engine unless it
-knows that the column holds none. DuckDB checks the column statistics, PostgreSQL needs a valid `NOT NULL` constraint,
-and Spark needs a non-nullable column or an `IS NOT NULL` filter. The SQLite table functions take NULL group keys in
-mode `'full'` and in `tessera_xty`, leave their rows out with a pair filter, and return an error on a NULL value. A
-DuckDB statement prepared while its summed columns held no NULLs returns an error that asks to prepare it again if
-NULLs arrive later.
+NULLs: group columns may hold NULLs, and so may summed and counted columns. As in SQL, a joined pair adds to a sum only
+when all its factors are non-NULL, a cell without such a pair has a NULL sum, `COUNT(col)` counts the pairs where `col`
+is not NULL, and `AVG` divides by that count. DuckDB does this for floating-point and integer weights, PostgreSQL for
+`float8` and integer weights, and Spark for `DOUBLE` weights and, in ANSI mode, `INT` and `BIGINT` weights. Such an
+integer sum under a pair filter needs a single comparison of two integer group columns, and in PostgreSQL and Spark it
+is a sum of one column or of a product of one column from each input. Where a column may hold NULLs, these stay with the
+engine: decimal weights, `AVG` of `float8` in PostgreSQL and of integers in Spark, integer weights without ANSI mode in
+Spark, and in PostgreSQL partitioned and inherited tables and inputs with their own plans. The SQLite table functions
+take NULL group keys in mode `'full'` and in `tessera_xty`, leave their rows out with a pair filter, and return an error
+on a NULL value. A DuckDB statement prepared while its summed columns held no NULLs returns an error that asks to
+prepare it again if NULLs arrive later.
 
 Operators: PostgreSQL's adapter recognizes only PostgreSQL's own operators and aggregates, so a user's `*` earlier on
 the search path keeps the engine's plan. A group or key computed from a column must be an expression that cannot raise
@@ -269,9 +288,18 @@ on macOS in a process without such a library.
 | `tessera_frontier` | `-1` | Number of most frequent values on the matrix accelerator (`-1`: cost model) |
 | `tessera_min_expansion` | `6` | Leave a self-join to DuckDB below this many estimated joined rows per input row |
 | `tessera_min_expansion_cross` | `6` | The same for products of two relations |
+| `tessera_min_expansion_measured` | `6` | The same for inputs without distinct counts, on the joined rows the planner counts itself |
 
 Tessera uses DuckDB's `threads`, and output beyond `memory_limit` goes to `temp_directory` within
 `max_temp_directory_size`.
+
+A pandas DataFrame or a Parquet or CSV file has no distinct counts, so the planner reads about 262,144 rows of each input
+and counts the joined rows itself. It reads a little of every row group of a local Parquet file and of every part of a
+DataFrame, so a file sorted by another column is measured like any other. It reads from the start where it cannot skip
+ahead: CSV files, remote files, a Parquet file with three quarters of its rows in one row group, inputs with a pushed
+filter, and several files without `parquet_metadata_cache`; a join that looks small there stays with DuckDB, with the
+same result. Arrow readers are read once only, so Arrow tables and Polars frames stay with DuckDB unless
+`tessera_min_expansion_cross` is set to `0`.
 
 ```sql
 SELECT * FROM tessera_sim('t', 'k', 'x', 'jaccard', 0.5);
@@ -413,6 +441,11 @@ prints phase times to stderr. The threshold and the top-k limit only prune, so k
 | `tessera_c_set_distinct_keys` | `COUNT(DISTINCT a.k)`: each shared key counts once per pair |
 | `tessera_c_set_two`, `tessera_c_next_batch2` | A count and a sum of the same pairs in one run |
 | `tessera_c_set_pair_filter` | Overflow checks that count only the pairs passing the caller's filters |
+| `tessera_c_set_many`, `tessera_c_add_many`, `tessera_c_next_many` | `COUNT(*)` and several sums of a product of two relations in one pass, one value per sum and row, with an optional pair filter |
+| `tessera_c_set_many_int`, `tessera_c_add_many2`, `tessera_c_next_many2`, `tessera_c_many_overflow` | Exact integer sums among them, each sum's overflow, and NULL factors: a pair adds to a sum only when neither row marks it NULL, and a sum without such a pair comes back NULL |
+| `tessera_c_set_group_top` | The top values of each group: only the cells that can reach rank `k` of their group come back |
+| `tessera_c_set_float_errors`, `tessera_c_set_float_accum`, `tessera_c_float_errors` | Whether a product of two doubles overflowed or underflowed to zero, for an engine that raises an error then |
+| `tessera_c_set_sum_limit` | The magnitude above which an integer sum is an error or NULL in the engine: no pruning unless every sum stays below it |
 | `tessera_c_general` | Whether the values come back as doubles (`vd`) rather than integers (`vi`) |
 
 Repeated rows with the same key and value are merged first. Integer weights (`tessera_c_add_i64`) and every

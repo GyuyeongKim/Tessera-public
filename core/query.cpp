@@ -19,6 +19,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -168,8 +170,9 @@ double cell_value(uint64_t s, bool general) {
 	return d;
 }
 
-int overflow_flags(const QueryResult &r, int product_bits, int sum_bits) {
-	if (!r.int_values) {
+static int OverflowFlags(bool int_values, __int128 prod_min, __int128 prod_max, __int128 cell_min, __int128 cell_max,
+                         int product_bits, int sum_bits) {
+	if (!int_values) {
 		return 0;
 	}
 	auto outside = [](__int128 lo, __int128 hi, int bits) {
@@ -179,7 +182,15 @@ int overflow_flags(const QueryResult &r, int product_bits, int sum_bits) {
 		const __int128 top = ((__int128)1 << (bits - 1)) - 1;
 		return lo < -top - 1 || hi > top;
 	};
-	return (outside(r.prod_min, r.prod_max, product_bits) ? 1 : 0) | (outside(r.cell_min, r.cell_max, sum_bits) ? 2 : 0);
+	return (outside(prod_min, prod_max, product_bits) ? 1 : 0) | (outside(cell_min, cell_max, sum_bits) ? 2 : 0);
+}
+
+int overflow_flags(const QueryResult &r, int product_bits, int sum_bits) {
+	return OverflowFlags(r.int_values, r.prod_min, r.prod_max, r.cell_min, r.cell_max, product_bits, sum_bits);
+}
+
+int overflow_flags(const QueryResult::SumResult &r, int product_bits, int sum_bits) {
+	return OverflowFlags(r.int_values, r.prod_min, r.prod_max, r.cell_min, r.cell_max, product_bits, sum_bits);
 }
 
 struct OomFlag {
@@ -952,8 +963,390 @@ static void ExactRowProducts(const std::pair<int32_t, int64_t> *t, int64_t m, co
 }
 
 
+template <class V, class Value>
+static void KeepGroupTop(QueryResult &qr, const QuerySpec &spec, int T, bool cross, Value value) {
+	const size_t items = qr.orig.size(), k = (size_t)spec.group_topk;
+	size_t cells = 0;
+	for (auto &c : qr.out) {
+		cells += cell_count(c, qr.wide);
+	}
+	if (items == 0 || cells <= k || k > (size_t(1) << 40) / items) {
+		return;
+	}
+	std::unique_ptr<V[]> heap;
+	std::unique_ptr<std::atomic<V>[]> low;
+	std::unique_ptr<std::atomic<uint32_t>[]> count;
+	std::unique_ptr<std::atomic_flag[]> locks;
+	const size_t nlocks = size_t(1) << 12;
+	try {
+		heap.reset(new V[items * k]);
+		low.reset(new std::atomic<V>[items]);
+		count.reset(new std::atomic<uint32_t>[items]);
+		locks.reset(new std::atomic_flag[nlocks]);
+	} catch (std::bad_alloc &) {
+		return;
+	}
+	for (size_t g = 0; g < items; g++) {
+		count[g].store(0, std::memory_order_relaxed);
+	}
+	for (size_t l = 0; l < nlocks; l++) {
+		locks[l].clear();
+	}
+	const PairMode mode = spec.mode;
+	const GroupOf of = spec.group_of;
+	const int64_t *orig = qr.orig.data();
+	const uint8_t *side = cross ? qr.side.data() : nullptr;
+	auto groups = [&](const Triple &t, int32_t *g) -> int {
+		if (cross) {
+			const bool sw = side[t.i] != 0;
+			g[0] = (of == GroupOf::FIRST) != sw ? t.i : t.j;
+			return 1;
+		}
+		if (t.i == t.j) {
+			g[0] = t.i;
+			return has_diag(mode) ? 1 : 0;
+		}
+		if (of == GroupOf::EACH) {
+			g[0] = t.i;
+			g[1] = t.j;
+			return 2;
+		}
+		g[0] = (orig[t.i] < orig[t.j]) == (of == GroupOf::LOWER) ? t.i : t.j;
+		return 1;
+	};
+	auto offer = [&](size_t g, V x) {
+		if (count[g].load(std::memory_order_acquire) == k && x < low[g].load(std::memory_order_relaxed)) {
+			return;
+		}
+		std::atomic_flag &lock = locks[g & (nlocks - 1)];
+		while (lock.test_and_set(std::memory_order_acquire)) {
+		}
+		V *h = heap.get() + g * k;
+		const uint32_t n = count[g].load(std::memory_order_relaxed);
+		if (n < k) {
+			h[n] = x;
+			if (n + 1 == k) {
+				std::make_heap(h, h + k, std::greater<V>());
+				low[g].store(h[0], std::memory_order_relaxed);
+			}
+			count[g].store(n + 1, std::memory_order_release);
+		} else if (x > h[0]) {
+			std::pop_heap(h, h + k, std::greater<V>());
+			h[k - 1] = x;
+			std::push_heap(h, h + k, std::greater<V>());
+			low[g].store(h[0], std::memory_order_relaxed);
+		}
+		lock.clear(std::memory_order_release);
+	};
+	const int64_t nc = (int64_t)qr.out.size();
+	const size_t cw = qr.wide ? 2 : 1;
+#pragma omp parallel for schedule(dynamic, 1) num_threads(T)
+	for (int64_t c = 0; c < nc; c++) {
+		const Cells &o = qr.out[c];
+		const size_t n = cell_count(o, qr.wide);
+		for (size_t q = 0; q < n; q++) {
+			int32_t g[2];
+			const int m = groups(o.data[cw * q], g);
+			if (m > 0) {
+				const V x = value(o, q);
+				for (int e = 0; e < m; e++) {
+					offer(g[e], x);
+				}
+			}
+		}
+	}
+#pragma omp parallel for schedule(dynamic, 1) num_threads(T)
+	for (int64_t c = 0; c < nc; c++) {
+		Cells &o = qr.out[c];
+		const size_t n = cell_count(o, qr.wide);
+		size_t w = 0;
+		for (size_t q = 0; q < n; q++) {
+			int32_t g[2];
+			const int m = groups(o.data[cw * q], g);
+			const V x = value(o, q);
+			bool keep = false;
+			for (int e = 0; e < m && !keep; e++) {
+				keep = count[g[e]].load(std::memory_order_relaxed) < k || x >= heap[(size_t)g[e] * k];
+			}
+			if (keep) {
+				for (size_t u = 0; u < cw && w != cw * q; u++) {
+					o.data[w + u] = o.data[cw * q + u];
+				}
+				w += cw;
+			}
+		}
+		o.n = w;
+	}
+}
+
+static void KeepGroupTopWide(QueryResult &qr, const QuerySpec &spec, int T, bool cross) {
+	const size_t items = qr.orig.size(), k = (size_t)spec.group_topk;
+	size_t cells = 0;
+	for (auto &c : qr.out) {
+		cells += cell_count(c, true);
+	}
+	if (items == 0 || cells <= k || k > (size_t(1) << 40) / items) {
+		return;
+	}
+	(void)T;
+	std::vector<std::vector<__int128>> heap;
+	try {
+		heap.resize(items);
+		for (auto &o : qr.out) {
+			const size_t n = cell_count(o, true);
+			for (size_t q = 0; q < n; q++) {
+				const Triple &t = o.data[2 * q];
+				int32_t g[2];
+				int m = 1;
+				if (cross) {
+					const bool sw = qr.side[t.i] != 0;
+					g[0] = (spec.group_of == GroupOf::FIRST) != sw ? t.i : t.j;
+				} else if (t.i == t.j) {
+					g[0] = t.i;
+					m = has_diag(spec.mode) ? 1 : 0;
+				} else if (spec.group_of == GroupOf::EACH) {
+					g[0] = t.i;
+					g[1] = t.j;
+					m = 2;
+				} else {
+					g[0] = (qr.orig[t.i] < qr.orig[t.j]) == (spec.group_of == GroupOf::LOWER) ? t.i : t.j;
+				}
+				const __int128 x = cell_value128(o, q, true);
+				for (int e = 0; e < m; e++) {
+					auto &h = heap[g[e]];
+					if (h.size() < k) {
+						h.push_back(x);
+						if (h.size() == k) {
+							std::make_heap(h.begin(), h.end(), std::greater<__int128>());
+						}
+					} else if (x > h[0]) {
+						std::pop_heap(h.begin(), h.end(), std::greater<__int128>());
+						h[k - 1] = x;
+						std::push_heap(h.begin(), h.end(), std::greater<__int128>());
+					}
+				}
+			}
+		}
+	} catch (std::bad_alloc &) {
+		return;
+	}
+	for (auto &o : qr.out) {
+		const size_t n = cell_count(o, true);
+		size_t w = 0;
+		for (size_t q = 0; q < n; q++) {
+			const Triple &t = o.data[2 * q];
+			const __int128 x = cell_value128(o, q, true);
+			int32_t g[2];
+			int m = 1;
+			if (cross) {
+				const bool sw = qr.side[t.i] != 0;
+				g[0] = (spec.group_of == GroupOf::FIRST) != sw ? t.i : t.j;
+			} else if (t.i == t.j) {
+				g[0] = t.i;
+				m = has_diag(spec.mode) ? 1 : 0;
+			} else if (spec.group_of == GroupOf::EACH) {
+				g[0] = t.i;
+				g[1] = t.j;
+				m = 2;
+			} else {
+				g[0] = (qr.orig[t.i] < qr.orig[t.j]) == (spec.group_of == GroupOf::LOWER) ? t.i : t.j;
+			}
+			bool keep = false;
+			for (int e = 0; e < m && !keep; e++) {
+				keep = heap[g[e]].size() < k || x >= heap[g[e]][0];
+			}
+			if (keep) {
+				for (size_t u = 0; u < 2 && w != 2 * q; u++) {
+					o.data[w + u] = o.data[2 * q + u];
+				}
+				w += 2;
+			}
+		}
+		o.n = w;
+	}
+}
+
+struct ValueRange {
+	double max_abs = 0, min_abs = HUGE_VAL;
+	bool nonfinite = false;
+	uint64_t rows = 0;
+	double bound() const {
+		return max_abs * max_abs * (double)rows * (double)rows;
+	}
+	bool may_overflow() const {
+		return !(bound() < std::numeric_limits<double>::max());
+	}
+	bool may_underflow() const {
+		return min_abs * min_abs == 0;
+	}
+	bool accum_may_overflow() const {
+		const double tmp = 2 * bound();
+		return !(tmp * tmp * (double)rows * (double)rows < std::numeric_limits<double>::max());
+	}
+};
+
+static void AddRange(const std::vector<std::unique_ptr<QueryPart>> &parts, int T, ValueRange &r) {
+	double mx = r.max_abs, mn = r.min_abs;
+	bool nf = r.nonfinite;
+	for (auto &p : parts) {
+		r.rows += p->k.size();
+		const double *v = p->v.data();
+		const int64_t *iv = p->iv.data();
+		const int64_t nv = (int64_t)p->v.size(), ni = (int64_t)p->iv.size();
+#pragma omp parallel for num_threads(T) schedule(static) reduction(max : mx) reduction(min : mn) reduction(|| : nf)
+		for (int64_t e = 0; e < nv; e++) {
+			if (!std::isfinite(v[e])) {
+				nf = true;
+				continue;
+			}
+			const double a = std::fabs(v[e]);
+			mx = std::max(mx, a);
+			if (a > 0) {
+				mn = std::min(mn, a);
+			}
+		}
+#pragma omp parallel for num_threads(T) schedule(static) reduction(max : mx)
+		for (int64_t e = 0; e < ni; e++) {
+			mx = std::max(mx, std::fabs((double)iv[e]));
+		}
+	}
+	r.max_abs = mx;
+	r.min_abs = mn;
+	r.nonfinite = nf;
+}
+
+static bool PruningUnsafe(const QuerySpec &spec, const ValueRange &r) {
+	return (spec.float_errors && (r.may_overflow() || r.may_underflow() || (spec.float_accum && r.accum_may_overflow()))) ||
+	       (spec.sum_limit > 0 && !(r.bound() < spec.sum_limit));
+}
+
+static int RowFloatErrors(double a, double b) {
+	uint64_t ba, bb;
+	memcpy(&ba, &a, sizeof a);
+	memcpy(&bb, &b, sizeof b);
+	if (ba == ROW_VALUE_OVERFLOW || bb == ROW_VALUE_OVERFLOW) {
+		return 1;
+	}
+	if (ba == ROW_VALUE_UNDERFLOW || bb == ROW_VALUE_UNDERFLOW) {
+		return 2;
+	}
+	return 0;
+}
+
+static int PairFloatErrors(double a, double b) {
+	if (const int f = RowFloatErrors(a, b)) {
+		return f;
+	}
+	const double p = a * b;
+	return (std::isinf(p) && !std::isinf(a) && !std::isinf(b) ? 1 : 0) | (p == 0 && a != 0 && b != 0 ? 2 : 0);
+}
+
+static int SumFloatError(double before, double term) {
+	return std::isinf(before + term) && !std::isinf(before) && !std::isinf(term) ? 1 : 0;
+}
+
+struct AccumCell {
+	double sum = 0, n = 0, sxx = 0;
+	int add(double v) {
+		const double before = sum, m = n;
+		n += 1;
+		sum += v;
+		if (m > 0) {
+			const double tmp = v * n - sum;
+			sxx += tmp * tmp / (n * m);
+			if (std::isinf(sum) || std::isinf(sxx)) {
+				const bool raise = !std::isinf(before) && !std::isinf(v);
+				sxx = std::numeric_limits<double>::quiet_NaN();
+				return raise ? 1 : 0;
+			}
+		} else if (!std::isfinite(v)) {
+			sxx = std::numeric_limits<double>::quiet_NaN();
+		}
+		return 0;
+	}
+};
+
+static void SumPairByPair(const vector<int64_t> &ptr, const vector<int32_t> &idx, const vector<double> &val, uint64_t RK,
+                          PairMode mode, const uint8_t *side, const std::function<int64_t(int32_t)> &value,
+                          const QuerySpec &spec, const std::function<void()> &check, QueryResult &qr) {
+	try {
+		std::unordered_map<uint64_t, AccumCell> cells;
+		for (uint64_t r = 0; r < RK; r++) {
+			if ((r & (POLL_EVERY - 1)) == 0) {
+				check();
+			}
+			for (int64_t a = ptr[r]; a < ptr[r + 1]; a++) {
+				for (int64_t b = ptr[r]; b < ptr[r + 1]; b++) {
+					const int32_t i = idx[a], j = idx[b];
+					if (side ? side[i] != 0 || side[j] == 0 : i > j || (i == j && !has_diag(mode))) {
+						continue;
+					}
+					AccumCell &cell = cells[((uint64_t)(uint32_t)std::min(i, j) << 32) | (uint32_t)std::max(i, j)];
+					const double term = val[a] * val[b];
+					int f = 0;
+					if (spec.float_accum) {
+						f = cell.add(term);
+					} else {
+						f = SumFloatError(cell.sum, term);
+						cell.sum += term;
+					}
+					if (spec.float_errors) {
+						f |= PairFloatErrors(val[a], val[b]);
+						if ((f & ~qr.float_errors) && (!spec.pair_pass || spec.pair_pass(spec.pair_ctx, value(i), value(j)))) {
+							qr.float_errors |= f;
+						}
+					}
+				}
+			}
+			if (qr.float_errors) {
+				return;
+			}
+		}
+		auto key = [](double x) { return std::isnan(x) ? HUGE_VAL : x; };
+		double tau = spec.min_value > 0 ? (double)spec.min_value : -HUGE_VAL;
+		if (spec.topk > 0) {
+			vector<double> kept;
+			for (auto &c : cells) {
+				if (key(c.second.sum) >= tau) {
+					kept.push_back(key(c.second.sum));
+				}
+			}
+			if ((int64_t)kept.size() >= spec.topk) {
+				std::nth_element(kept.begin(), kept.begin() + (spec.topk - 1), kept.end(), std::greater<double>());
+				tau = kept[spec.topk - 1];
+			}
+		}
+		if (tau > -HUGE_VAL) {
+			for (auto it = cells.begin(); it != cells.end();) {
+				it = key(it->second.sum) >= tau ? std::next(it) : cells.erase(it);
+			}
+		}
+		const size_t chunk = size_t(1) << 20;
+		qr.out.clear();
+		size_t room = 0;
+		Triple *t = nullptr;
+		for (auto &c : cells) {
+			if (room == 0) {
+				room = std::min(chunk, cells.size() - qr.out.size() * chunk);
+				qr.out.emplace_back();
+				qr.out.back().data = ChunkPtr(new Triple[room], ChunkFree(room * sizeof(Triple)));
+				qr.out.back().n = room;
+				t = qr.out.back().data.get();
+			}
+			t->i = (int32_t)(c.first >> 32);
+			t->j = (int32_t)(uint32_t)c.first;
+			memcpy(&t->s, &c.second.sum, sizeof c.second.sum);
+			t++;
+			room--;
+		}
+	} catch (const std::bad_alloc &) {
+		qr.out.clear();
+		throw OutOfMemory("tessera: out of memory (the cells of a sum computed pair by pair)");
+	}
+}
+
 static void RunQuery(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector<std::unique_ptr<QueryPart>> *parts_y,
-                     const QuerySpec &spec, QueryResult &qr) {
+                     QuerySpec spec, QueryResult &qr) {
 	const int T = std::min(spec.threads > 0 ? spec.threads : omp_get_max_threads(), std::max(1, omp_get_num_procs()));
 	const bool has_value = spec.has_value;
 	const bool verbose = spec.verbose;
@@ -999,6 +1392,16 @@ static void RunQuery(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector
 	}
 	double t0 = Now();
 	const int P = (int)parts.size();
+	ValueRange range;
+	if (has_value) {
+		AddRange(parts, T, range);
+		if (PruningUnsafe(spec, range)) {
+			spec.min_value = 0;
+			spec.topk = -1;
+			spec.group_topk = -1;
+		}
+	}
+	qr.float_errors = 0;
 	int64_t minx = INT64_MAX, maxx = INT64_MIN, mink = INT64_MAX, maxk = INT64_MIN;
 	size_t n = 0;
 	for (auto &p : parts) {
@@ -1101,7 +1504,47 @@ static void RunQuery(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector
 	check();
 	double tb1e = Now();
 	vector<int32_t> rank_of(RX, -1);
-	{
+	if ((uint64_t)P * RX > (uint64_t)n) {
+		vector<std::atomic<uint32_t>> cnt(RX);
+#pragma omp parallel for num_threads(T) schedule(static)
+		for (int64_t i = 0; i < (int64_t)RX; i++) {
+			cnt[i].store(0, std::memory_order_relaxed);
+		}
+#pragma omp parallel for num_threads(T) schedule(dynamic, 1)
+		for (int p = 0; p < P; p++) {
+			const auto &px = parts[p]->x;
+			for (size_t e = 0; e < px.size() && !poll((int64_t)e); e++) {
+				cnt[px[e] - minx].fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		check();
+		uint32_t top = 0;
+		for (uint64_t i = 0; i < RX; i++) {
+			top = std::max(top, cnt[i].load(std::memory_order_relaxed));
+		}
+		vector<int64_t> first((size_t)top + 1, 0);
+		for (uint64_t i = 0; i < RX; i++) {
+			first[cnt[i].load(std::memory_order_relaxed)]++;
+		}
+		first[0] = 0;
+		int64_t items = 0;
+		for (int64_t c = top; c > 0; c--) {
+			const int64_t m = first[c];
+			first[c] = items;
+			items += m;
+		}
+		qr.orig.resize(items);
+		for (uint64_t i = 0; i < RX; i++) {
+			const uint32_t c = cnt[i].load(std::memory_order_relaxed);
+			if (c) {
+				const int64_t r = first[c]++;
+				const int64_t x = (int64_t)i + minx;
+				qr.orig[r] = dictx.empty() ? x : dictx[x];
+				rank_of[i] = (int32_t)r;
+			}
+		}
+		X.n_cols = (int32_t)items;
+	} else {
 		vector<uint32_t> cnt(RX, 0);
 		vector<vector<uint32_t>> h(P);
 		OomFlag oom;
@@ -1297,6 +1740,34 @@ static void RunQuery(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector
 			qr.prod_min = all.lo;
 			qr.prod_max = all.hi;
 			MergeRowsInt(X, T, RK, ptr, idx, ival, keep);
+		} else if (has_v && spec.similarity == Similarity::NONE &&
+		           (((range.nonfinite || range.may_overflow()) && dup) ||
+		            (spec.float_errors && (range.may_overflow() || range.may_underflow() ||
+		                                   (spec.float_accum && range.accum_may_overflow()))))) {
+			const size_t items = qr.orig.size();
+			vector<uint8_t> sides(cross ? items : 0);
+			vector<int64_t> values(items);
+			for (size_t r = 0; r < items; r++) {
+				if (cross) {
+					sides[r] = qr.orig[r] >= cx.count;
+				}
+				values[r] = !cross ? qr.orig[r] : sides[r] ? cy.value(qr.orig[r] - cx.count) : cx.value(qr.orig[r]);
+			}
+			SumPairByPair(ptr, idx, val, RK, spec.mode, cross ? sides.data() : nullptr,
+			              [&](int32_t r) { return values[r]; }, spec, check, qr);
+			check();
+			qr.general = true;
+			if (cross) {
+				qr.side = std::move(sides);
+				qr.orig = std::move(values);
+			}
+			if (spec.group_topk > 0 && !qr.float_errors) {
+				KeepGroupTop<double>(qr, spec, T, cross, [](const Cells &o, size_t q) {
+					const double x = cell_value(o.data[q].s, true);
+					return std::isnan(x) ? HUGE_VAL : x;
+				});
+			}
+			return;
 		} else {
 			MergeRows(X, qr, T, RK, has_v, ptr, idx, val, keep, dup && !spec.distinct_keys,
 			          spec.similarity == Similarity::NONE);
@@ -1753,6 +2224,28 @@ static void RunQuery(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector
 		}
 		qr.orig.swap(o);
 	}
+	if (spec.group_topk > 0 && !simm) {
+		const double t_group = Now();
+		size_t before = 0, after = 0;
+		for (auto &o : qr.out) {
+			before += o.n;
+		}
+		if (qr.general) {
+			KeepGroupTop<double>(qr, spec, T, cross, [](const Cells &o, size_t q) {
+				const double x = cell_value(o.data[q].s, true);
+				return std::isnan(x) ? HUGE_VAL : x;
+			});
+		} else if (qr.wide) {
+			KeepGroupTopWide(qr, spec, T, cross);
+		} else {
+			KeepGroupTop<int64_t>(qr, spec, T, cross, [](const Cells &o, size_t q) { return (int64_t)o.data[q].s; });
+		}
+		for (auto &o : qr.out) {
+			after += o.n;
+		}
+		plog += Fmt("%sgroup top-%lld: %zu of %zu cells (%.3f s)", plog.empty() ? "" : "; ", (long long)spec.group_topk,
+		            after, before, Now() - t_group);
+	}
 	if (verbose) {
 		size_t cells = 0;
 		for (auto &o : qr.out) {
@@ -1828,6 +2321,17 @@ void run_query_two(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector<s
 	}
 	QuerySpec cs = spec;
 	cs.has_value = false;
+	ValueRange range;
+	const int TR = std::min(spec.threads > 0 ? spec.threads : omp_get_max_threads(), std::max(1, omp_get_num_procs()));
+	AddRange(parts, TR, range);
+	if (parts_y) {
+		AddRange(*parts_y, TR, range);
+	}
+	if (PruningUnsafe(spec, range)) {
+		cs.min_value = 0;
+		cs.topk = -1;
+		cs.group_topk = -1;
+	}
 	RunQuery(cx, parts_y ? &cy : nullptr, cs, qr);
 	size_t heap1;
 	uint64_t spill1;
@@ -1835,6 +2339,7 @@ void run_query_two(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector<s
 	QuerySpec ss = spec;
 	ss.min_value = 0;
 	ss.topk = -1;
+	ss.group_topk = -1;
 	ss.distinct_keys = false;
 	if (spec.out_budget) {
 		ss.out_budget = spec.out_budget > heap1 ? spec.out_budget - heap1 : 1;
@@ -1848,6 +2353,7 @@ void run_query_two(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector<s
 	Team team(T, spec.release_threads);
 	const double tm = Now();
 	qr.general2 = r2.general;
+	qr.float_errors = r2.float_errors;
 	qr.int_values = r2.int_values;
 	qr.prod_min = r2.prod_min;
 	qr.prod_max = r2.prod_max;
@@ -2040,6 +2546,511 @@ void run_query_two(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector<s
 		        "%.3f, lookup %.3f)%s\n",
 		        (size_t)off[R], Now() - tm, batches, tm_count - tm, t_scatter, t_sort, t_lookup,
 		        to.empty() ? "" : ", ranks translated");
+	}
+}
+
+void run_query_many(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector<std::unique_ptr<QueryPart>> &parts_y,
+                    size_t n_sums, const QuerySpec &spec, QueryResult &qr) {
+	if (n_sums == 0 || spec.similarity != Similarity::NONE) {
+		throw std::runtime_error("tessera: many aggregates need sums, without similarity");
+	}
+	const int T = std::min(spec.threads > 0 ? spec.threads : omp_get_max_threads(), std::max(1, omp_get_num_procs()));
+	Team team(T, spec.release_threads);
+	const double t0 = Now();
+	std::atomic<bool> stopped {false};
+	auto poll = [&](int64_t i) {
+		if ((i & (POLL_EVERY - 1)) != 0) {
+			return false;
+		}
+		if (spec.should_stop && omp_get_thread_num() == 0 && !stopped.load(std::memory_order_relaxed) &&
+		    spec.should_stop(spec.stop_ctx)) {
+			stopped.store(true, std::memory_order_relaxed);
+		}
+		return stopped.load(std::memory_order_relaxed);
+	};
+	auto check = [&]() {
+		if (stopped.load() || (spec.should_stop && spec.should_stop(spec.stop_ctx))) {
+			throw Cancelled();
+		}
+	};
+	std::vector<uint8_t> is_int(n_sums, 0);
+	size_t rows[2] = {0, 0};
+	bool masked = false;
+	for (int side = 0; side < 2; side++) {
+		for (auto &p : side ? parts_y : parts) {
+			if (p->x.size() != p->k.size()) {
+				throw std::runtime_error("tessera: a part has group keys for some of its rows");
+			}
+			rows[side] += p->k.size();
+			if (p->k.empty()) {
+				continue;
+			}
+			if (p->sum_v.size() != n_sums || p->sum_iv.size() != n_sums) {
+				throw std::runtime_error("tessera: a part has values for some of the sums");
+			}
+			for (size_t s = 0; s < n_sums; s++) {
+				if (!p->sum_iv[s].empty()) {
+					is_int[s] = 1;
+				}
+			}
+			if (!p->sum_null.empty()) {
+				if (p->sum_null.size() != p->k.size()) {
+					throw std::runtime_error("tessera: a part has NULL marks for some of its rows");
+				}
+				masked = true;
+			}
+		}
+	}
+	for (int side = 0; side < 2; side++) {
+		for (auto &p : side ? parts_y : parts) {
+			for (size_t s = 0; s < n_sums && !p->k.empty(); s++) {
+				if ((is_int[s] ? p->sum_iv[s].size() : p->sum_v[s].size()) != p->k.size()) {
+					throw std::runtime_error("tessera: a part has values for some of its rows");
+				}
+			}
+		}
+	}
+	if (masked && n_sums > 64) {
+		throw std::runtime_error("tessera: NULL marks for more than 64 sums");
+	}
+	const uint64_t all_sums = n_sums >= 64 ? ~0ull : (1ull << n_sums) - 1;
+	std::vector<size_t> slot(n_sums);
+	size_t nd = 0, ni = 0, stride = 1;
+	qr.sums.assign(n_sums, QueryResult::SumResult());
+	for (size_t s = 0; s < n_sums; s++) {
+		slot[s] = is_int[s] ? ni++ : nd++;
+		qr.sums[s].at = stride;
+		qr.sums[s].general = !is_int[s];
+		qr.sums[s].int_values = is_int[s];
+		stride += is_int[s] ? 2 : 1;
+	}
+	qr.null_at = 0;
+	if (masked) {
+		qr.null_at = stride++;
+	}
+	qr.stride = stride;
+	qr.general = qr.wide = false;
+	qr.float_errors = 0;
+	qr.out.clear();
+	std::vector<size_t> dsum(nd), isum(ni);
+	std::vector<uint64_t> dbit(nd), ibit(ni);
+	for (size_t s = 0; s < n_sums; s++) {
+		(is_int[s] ? isum : dsum)[slot[s]] = s;
+		(is_int[s] ? ibit : dbit)[slot[s]] = s < 64 ? 1ull << s : 0;
+	}
+	if (rows[0] == 0 || rows[1] == 0) {
+		parts.clear();
+		parts_y.clear();
+		return;
+	}
+	SideCodes cx = EncodeSide(parts, T, poll);
+	check();
+	SideCodes cy = EncodeSide(parts_y, T, poll);
+	check();
+	int64_t mink = INT64_MAX, maxk = INT64_MIN;
+	for (int side = 0; side < 2; side++) {
+		for (auto &p : side ? parts_y : parts) {
+			for (auto k : p->k) {
+				mink = std::min(mink, k);
+				maxk = std::max(maxk, k);
+			}
+		}
+	}
+	const uint64_t kspan = (uint64_t)maxk - (uint64_t)mink;
+	size_t nkeys;
+	const size_t nx_parts = parts.size();
+	if (kspan < (1ull << 28) && (double)kspan + 1 <= RANGE_PER_DISTINCT * (double)(rows[0] + rows[1])) {
+		nkeys = (size_t)kspan + 1;
+		for (int side = 0; side < 2; side++) {
+			for (auto &p : side ? parts_y : parts) {
+#pragma omp parallel for num_threads(T) schedule(static)
+				for (int64_t e = 0; e < (int64_t)p->k.size(); e++) {
+					p->k[e] -= mink;
+				}
+			}
+		}
+	} else {
+		std::vector<std::unique_ptr<QueryPart>> all;
+		for (auto &p : parts) {
+			all.push_back(std::move(p));
+		}
+		for (auto &p : parts_y) {
+			all.push_back(std::move(p));
+		}
+		nkeys = Encode(all, &QueryPart::k, T).size();
+		check();
+		for (size_t p = 0; p < all.size(); p++) {
+			(p < nx_parts ? parts[p] : parts_y[p - nx_parts]) = std::move(all[p]);
+		}
+	}
+	const size_t nxi = (size_t)cx.count, nyi = (size_t)cy.count;
+	if (nxi + nyi > (size_t)INT32_MAX) {
+		throw std::runtime_error("tessera: more than 2^31 - 1 group keys");
+	}
+	std::unique_ptr<std::atomic<int64_t>[]> ox(new std::atomic<int64_t>[nxi + 1]), oy(new std::atomic<int64_t>[nkeys + 1]);
+#pragma omp parallel for num_threads(T) schedule(static)
+	for (int64_t i = 0; i <= (int64_t)nxi; i++) {
+		ox[i].store(0, std::memory_order_relaxed);
+	}
+#pragma omp parallel for num_threads(T) schedule(static)
+	for (int64_t i = 0; i <= (int64_t)nkeys; i++) {
+		oy[i].store(0, std::memory_order_relaxed);
+	}
+	for (auto &p : parts) {
+#pragma omp parallel for num_threads(T) schedule(static)
+		for (int64_t e = 0; e < (int64_t)p->x.size(); e++) {
+			ox[p->x[e]].fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	for (auto &p : parts_y) {
+#pragma omp parallel for num_threads(T) schedule(static)
+		for (int64_t e = 0; e < (int64_t)p->k.size(); e++) {
+			oy[p->k[e]].fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	auto running = [](std::atomic<int64_t> *o, size_t n) {
+		int64_t sum = 0;
+		for (size_t i = 0; i <= n; i++) {
+			const int64_t c = o[i].load(std::memory_order_relaxed);
+			o[i].store(sum, std::memory_order_relaxed);
+			sum += c;
+		}
+	};
+	running(ox.get(), nxi);
+	running(oy.get(), nkeys);
+	std::vector<int32_t> xkey(rows[0]), yitem(rows[1]);
+	std::vector<double> xd(rows[0] * nd), yd(rows[1] * nd);
+	std::vector<int64_t> xi(rows[0] * ni), yi(rows[1] * ni);
+	std::vector<uint64_t> xm(masked ? rows[0] : 0), ym(masked ? rows[1] : 0);
+	for (int side = 0; side < 2; side++) {
+		for (auto &p : side ? parts_y : parts) {
+#pragma omp parallel for num_threads(T) schedule(static)
+			for (int64_t e = 0; e < (int64_t)p->k.size(); e++) {
+				const int64_t at = (side ? oy[p->k[e]] : ox[p->x[e]]).fetch_add(1, std::memory_order_relaxed);
+				if (side) {
+					yitem[at] = (int32_t)p->x[e];
+				} else {
+					xkey[at] = (int32_t)p->k[e];
+				}
+				for (size_t c = 0; c < nd; c++) {
+					(side ? yd : xd)[(size_t)at * nd + c] = p->sum_v[dsum[c]][e];
+				}
+				for (size_t c = 0; c < ni; c++) {
+					(side ? yi : xi)[(size_t)at * ni + c] = p->sum_iv[isum[c]][e];
+				}
+				if (masked) {
+					(side ? ym : xm)[at] = p->sum_null.empty() ? 0 : p->sum_null[e] & all_sums;
+				}
+			}
+		}
+		(side ? parts_y : parts).clear();
+	}
+	check();
+	const double t1 = Now();
+	OutSpace space;
+	space.budget = spec.out_budget;
+	space.dir = spec.spill_dir;
+	space.spill = spec.spill;
+	space.mkdir_dir = spec.spill_mkdir;
+	space.spill_limit = spec.spill_limit;
+	space.chunk_cells = spec.out_chunk ? spec.out_chunk : std::max<size_t>(stride, (size_t(1) << 20));
+	space.chunk_cells = std::max(stride, space.chunk_cells / stride * stride);
+	space.lanes(T);
+	std::vector<std::vector<Cells>> chunks(T);
+	std::vector<uint64_t> products(T, 0);
+	std::vector<std::vector<__int128>> ranges(T, std::vector<__int128>(ni * 4, 0));
+	std::vector<std::vector<uint8_t>> ranged(T, std::vector<uint8_t>(ni * 2, 0));
+	bool check_pairs = false;
+	if (spec.float_errors && nd) {
+		ValueRange vr;
+		vr.rows = rows[0] + rows[1];
+		double mx = 0, mn = HUGE_VAL;
+		bool marked = false;
+		const int64_t ntotal[2] = {(int64_t)xd.size(), (int64_t)yd.size()};
+		const double *dv[2] = {xd.data(), yd.data()};
+		for (int side = 0; side < 2; side++) {
+			const double *d = dv[side];
+#pragma omp parallel for num_threads(T) schedule(static) reduction(max : mx) reduction(min : mn) reduction(|| : marked)
+			for (int64_t e = 0; e < ntotal[side]; e++) {
+				uint64_t bits;
+				memcpy(&bits, &d[e], sizeof bits);
+				marked = marked || bits == ROW_VALUE_OVERFLOW || bits == ROW_VALUE_UNDERFLOW;
+				if (std::isfinite(d[e])) {
+					const double a = std::fabs(d[e]);
+					mx = std::max(mx, a);
+					if (a > 0) {
+						mn = std::min(mn, a);
+					}
+				}
+			}
+		}
+		vr.max_abs = mx;
+		vr.min_abs = mn;
+		check_pairs = marked || vr.may_overflow() || vr.may_underflow();
+	}
+	std::vector<int> pair_errors(T, 0);
+	std::vector<std::set<std::tuple<int32_t, int32_t, int>>> error_pairs(T);
+	std::vector<int64_t> yval;
+	const int pair_op = spec.many_pair_op;
+	if (pair_op) {
+		yval.resize(nyi);
+		for (size_t j = 0; j < nyi; j++) {
+			yval[j] = cy.value((int64_t)j);
+		}
+	}
+	OomFlag oom;
+#pragma omp parallel num_threads(T)
+	{
+		const int tid = omp_get_thread_num();
+		std::vector<double> ad;
+		std::vector<__int128> ai;
+		std::vector<uint64_t> cnt, had;
+		std::vector<int32_t> touched;
+		bool ok = oom.run([&] {
+			ad.assign(nyi * nd, 0.0);
+			ai.assign(nyi * ni, 0);
+			cnt.assign(nyi, 0);
+			had.assign(masked ? nyi : 0, 0);
+			touched.reserve(1 << 16);
+		});
+		ChunkPtr spare;
+		Triple *cur = nullptr, *end = nullptr;
+		__int128 *rng = ranges[tid].data();
+		uint8_t *seen = ranged[tid].data();
+		auto close_chunk = [&]() {
+			if (cur) {
+				Cells &c = chunks[tid].back();
+				c.n = (size_t)(cur - c.data.get());
+				space.settle(c, spare, tid);
+				cur = end = nullptr;
+			}
+		};
+		auto open_chunk = [&]() {
+			close_chunk();
+			if (space.failed.load(std::memory_order_relaxed)) {
+				return false;
+			}
+			try {
+				chunks[tid].emplace_back();
+				chunks[tid].back().data = spare ? std::move(spare) : space.alloc(space.chunk_cells);
+			} catch (const std::bad_alloc &) {
+				if (!chunks[tid].empty() && !chunks[tid].back().data) {
+					chunks[tid].pop_back();
+				}
+				space.no_memory();
+				return false;
+			}
+			cur = chunks[tid].back().data.get();
+			end = cur + space.chunk_cells;
+			return true;
+		};
+#pragma omp for schedule(dynamic, 16)
+		for (int64_t i = 0; i < (int64_t)nxi; i++) {
+			if (!ok || poll(i) || space.failed.load(std::memory_order_relaxed)) {
+				continue;
+			}
+			const int64_t rb = i == 0 ? 0 : ox[i - 1].load(std::memory_order_relaxed), re = ox[i].load(std::memory_order_relaxed);
+			uint64_t made = 0;
+			const int64_t xv = pair_op ? cx.value(i) : 0;
+			for (int64_t r = rb; r < re; r++) {
+				const int32_t key = xkey[r];
+				const int64_t b = key == 0 ? 0 : oy[key - 1].load(std::memory_order_relaxed), e = oy[key].load(std::memory_order_relaxed);
+				const double *vd = nd ? xd.data() + (size_t)r * nd : nullptr;
+				const int64_t *vi = ni ? xi.data() + (size_t)r * ni : nullptr;
+				for (int64_t q = b; q < e; q++) {
+					const int32_t j = yitem[q];
+					if (pair_op) {
+						const int64_t yv = yval[j];
+						const bool pass = pair_op == 1   ? xv < yv
+						                  : pair_op == 2 ? xv <= yv
+						                  : pair_op == 3 ? xv > yv
+						                  : pair_op == 4 ? xv >= yv
+						                                 : xv != yv;
+						if (!pass) {
+							continue;
+						}
+					}
+					if (cnt[j]++ == 0) {
+						if (touched.size() == touched.capacity()) {
+							ok = oom.run([&] { touched.reserve(touched.capacity() * 2); });
+							if (!ok) {
+								cnt[j] = 0;
+								break;
+							}
+						}
+						touched.push_back(j);
+					}
+					const uint64_t skip = masked ? xm[r] | ym[q] : 0;
+					if (masked) {
+						had[j] |= ~skip;
+					}
+					double *ac = nd ? ad.data() + (size_t)j * nd : nullptr;
+					const double *wd = nd ? yd.data() + (size_t)q * nd : nullptr;
+					int f = 0;
+					if (check_pairs) {
+						for (size_t c = 0; c < nd; c++) {
+							f |= skip & dbit[c] ? RowFloatErrors(vd[c], wd[c])
+							                    : PairFloatErrors(vd[c], wd[c]) | SumFloatError(ac[c], vd[c] * wd[c]);
+						}
+					}
+					if (!skip) {
+						for (size_t c = 0; c < nd; c++) {
+							ac[c] += vd[c] * wd[c];
+						}
+					} else {
+						for (size_t c = 0; c < nd; c++) {
+							if (!(skip & dbit[c])) {
+								ac[c] += vd[c] * wd[c];
+							}
+						}
+					}
+					if (check_pairs) {
+						if (f && !spec.pair_pass) {
+							pair_errors[tid] |= f;
+						} else if (f) {
+							ok = oom.run([&] { error_pairs[tid].insert(std::make_tuple((int32_t)i, j, f)); });
+							if (!ok) {
+								break;
+							}
+						}
+					}
+					if (ni) {
+						__int128 *ax = ai.data() + (size_t)j * ni;
+						const int64_t *wi = yi.data() + (size_t)q * ni;
+						for (size_t c = 0; c < ni; c++) {
+							if (skip & ibit[c]) {
+								continue;
+							}
+							const __int128 pr = (__int128)vi[c] * wi[c];
+							ax[c] += pr;
+							if (!seen[2 * c] || pr < rng[4 * c]) {
+								rng[4 * c] = pr;
+							}
+							if (!seen[2 * c] || pr > rng[4 * c + 1]) {
+								rng[4 * c + 1] = pr;
+							}
+							seen[2 * c] = 1;
+						}
+					}
+				}
+				made += (uint64_t)(e - b);
+			}
+			products[tid] += made;
+			for (int32_t j : touched) {
+				const uint64_t nulls = masked ? all_sums & ~had[j] : 0;
+				if (masked) {
+					had[j] = 0;
+				}
+				if (cur == end && !open_chunk()) {
+					cnt[j] = 0;
+					continue;
+				}
+				cur[0].i = (int32_t)i;
+				cur[0].j = (int32_t)nxi + j;
+				cur[0].s = cnt[j];
+				cnt[j] = 0;
+				if (masked) {
+					Triple *t = cur + qr.null_at;
+					t[0].i = cur[0].i;
+					t[0].j = cur[0].j;
+					t[0].s = nulls;
+				}
+				for (size_t s = 0; s < n_sums; s++) {
+					Triple *t = cur + qr.sums[s].at;
+					t[0].i = cur[0].i;
+					t[0].j = cur[0].j;
+					if (!is_int[s]) {
+						double &a = ad[(size_t)j * nd + slot[s]];
+						memcpy(&t[0].s, &a, sizeof a);
+						a = 0;
+					} else {
+						__int128 &a = ai[(size_t)j * ni + slot[s]];
+						t[0].s = (uint64_t)a;
+						t[1].i = t[0].i;
+						t[1].j = t[0].j;
+						t[1].s = (uint64_t)(a >> 64);
+						const size_t c = slot[s];
+						if (!(nulls >> s & 1)) {
+							if (!seen[2 * c + 1] || a < rng[4 * c + 2]) {
+								rng[4 * c + 2] = a;
+							}
+							if (!seen[2 * c + 1] || a > rng[4 * c + 3]) {
+								rng[4 * c + 3] = a;
+							}
+							seen[2 * c + 1] = 1;
+						}
+						a = 0;
+					}
+				}
+				cur += stride;
+			}
+			touched.clear();
+		}
+		close_chunk();
+		space.release(spare);
+	}
+	oom.check("the sums' accumulators");
+	check();
+	if (space.oom.load()) {
+		throw OutOfMemory("tessera: out of memory (output cells)");
+	}
+	if (space.failed.load()) {
+		throw SpillError(space.error, space.limit_hit);
+	}
+	for (int t = 0; t < T; t++) {
+		if (!space.map_spilled(chunks[t], t)) {
+			throw SpillError(space.error, space.limit_hit);
+		}
+		for (auto &c : chunks[t]) {
+			qr.out.push_back(std::move(c));
+		}
+	}
+	for (int t = 0; t < T; t++) {
+		qr.float_errors |= pair_errors[t];
+		for (auto &e : error_pairs[t]) {
+			if ((std::get<2>(e) & ~qr.float_errors) &&
+			    spec.pair_pass(spec.pair_ctx, cx.value(std::get<0>(e)), cy.value(std::get<1>(e)))) {
+				qr.float_errors |= std::get<2>(e);
+			}
+		}
+	}
+	for (size_t c = 0; c < ni; c++) {
+		auto &r = qr.sums[isum[c]];
+		bool have_p = false, have_c = false;
+		for (int t = 0; t < T; t++) {
+			if (ranged[t][2 * c]) {
+				r.prod_min = have_p ? std::min(r.prod_min, ranges[t][4 * c]) : ranges[t][4 * c];
+				r.prod_max = have_p ? std::max(r.prod_max, ranges[t][4 * c + 1]) : ranges[t][4 * c + 1];
+				have_p = true;
+			}
+			if (ranged[t][2 * c + 1]) {
+				r.cell_min = have_c ? std::min(r.cell_min, ranges[t][4 * c + 2]) : ranges[t][4 * c + 2];
+				r.cell_max = have_c ? std::max(r.cell_max, ranges[t][4 * c + 3]) : ranges[t][4 * c + 3];
+				have_c = true;
+			}
+		}
+	}
+	qr.orig.resize(nxi + nyi);
+	qr.side.resize(nxi + nyi);
+	for (size_t i = 0; i < nxi; i++) {
+		qr.orig[i] = cx.value((int64_t)i);
+		qr.side[i] = 0;
+	}
+	for (size_t j = 0; j < nyi; j++) {
+		qr.orig[nxi + j] = cy.value((int64_t)j);
+		qr.side[nxi + j] = 1;
+	}
+	if (spec.verbose) {
+		uint64_t made = 0;
+		size_t triples = 0;
+		for (auto x : products) {
+			made += x;
+		}
+		for (auto &c : qr.out) {
+			triples += c.n;
+		}
+		fprintf(stderr, "tessera: %zu sums: %zu + %zu rows, build %.3f s, %llu products, %zu cells, total %.3f s\n", n_sums,
+		        rows[0], rows[1], t1 - t0, (unsigned long long)made, triples / stride, Now() - t0);
 	}
 }
 

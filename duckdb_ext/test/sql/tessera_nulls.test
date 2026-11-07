@@ -1,0 +1,575 @@
+require tessera
+
+statement ok
+SET tessera_min_expansion = 0;
+
+statement ok
+SET tessera_min_expansion_cross = 0;
+
+statement ok
+SET tessera_min_expansion_measured = 0;
+
+statement ok
+CREATE TABLE r AS SELECT (hash(i) % 300)::BIGINT AS k, (hash(i * 7) % 40)::BIGINT AS x,
+  CASE WHEN hash(i * 7) % 40 = 7 OR hash(i * 3) % 4 = 0 THEN NULL WHEN hash(i * 29) % 97 = 0 THEN 'inf'::DOUBLE
+       ELSE (1 + hash(i * 5) % 5)::DOUBLE END AS v,
+  CASE WHEN hash(i * 11) % 5 = 0 THEN NULL ELSE (hash(i * 13) % 7)::BIGINT END AS iv,
+  CASE WHEN hash(i * 31) % 6 = 0 THEN NULL ELSE (hash(i * 37) % 9)::BIGINT END AS xn,
+  'item-' || (hash(i * 7) % 40) AS xs,
+  CASE WHEN hash(i * 41) % 3 = 0 THEN NULL WHEN hash(i * 43) % 50 = 0 THEN 2000000000 ELSE 3 END::INTEGER AS big
+  FROM range(6000) t(i);
+
+statement ok
+CREATE TABLE s AS SELECT (hash(i + 1) % 300)::BIGINT AS k, (hash(i * 17) % 30)::BIGINT AS y,
+  CASE WHEN hash(i * 19) % 3 = 0 THEN NULL ELSE (1 + hash(i * 23) % 4)::DOUBLE END AS w,
+  CASE WHEN hash(i * 47) % 4 = 0 THEN NULL ELSE (hash(i * 53) % 11)::BIGINT END AS jw,
+  CASE WHEN hash(i * 59) % 2 = 0 THEN NULL ELSE 2 END::INTEGER AS big
+  FROM range(4000) t(i);
+
+statement ok
+COPY r TO '{TEST_DIR}/nulls_r.csv' (HEADER);
+
+query II
+EXPLAIN SELECT a.x, b.y, SUM(a.v * b.w) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_sum AS SELECT a.x, b.y, SUM(a.v * b.w) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_sum AS SELECT a.x, b.y, SUM(a.v * b.w) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_sum EXCEPT ALL SELECT * FROM off_sum) UNION ALL (SELECT * FROM off_sum EXCEPT ALL SELECT * FROM on_sum));
+----
+0
+
+query I
+SELECT count(*) > 0 FROM on_sum WHERE s IS NULL;
+----
+true
+
+query II
+EXPLAIN SELECT a.x, b.y, COUNT(*) AS c, SUM(a.v * b.w) AS s, AVG(a.v * b.w) AS m FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_three AS SELECT a.x, b.y, COUNT(*) AS c, SUM(a.v * b.w) AS s, AVG(a.v * b.w) AS m FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_three AS SELECT a.x, b.y, COUNT(*) AS c, SUM(a.v * b.w) AS s, AVG(a.v * b.w) AS m FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_three EXCEPT ALL SELECT * FROM off_three) UNION ALL (SELECT * FROM off_three EXCEPT ALL SELECT * FROM on_three));
+----
+0
+
+query I
+SELECT count(*) > 0 FROM on_three WHERE s IS NULL;
+----
+true
+
+query II
+EXPLAIN SELECT a.x, b.y, SUM(a.v * b.w) / (sqrt(SUM(a.v * a.v)) * sqrt(SUM(b.w * b.w))) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_cosine AS SELECT a.x, b.y, SUM(a.v * b.w) / (sqrt(SUM(a.v * a.v)) * sqrt(SUM(b.w * b.w))) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_cosine AS SELECT a.x, b.y, SUM(a.v * b.w) / (sqrt(SUM(a.v * a.v)) * sqrt(SUM(b.w * b.w))) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_cosine EXCEPT ALL SELECT * FROM off_cosine) UNION ALL (SELECT * FROM off_cosine EXCEPT ALL SELECT * FROM on_cosine));
+----
+0
+
+query I
+SELECT count(*) > 0 FROM on_cosine WHERE s IS NULL;
+----
+true
+
+query II
+EXPLAIN SELECT a.x, b.y, SUM(a.iv * b.jw) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_int_sum AS SELECT a.x, b.y, SUM(a.iv * b.jw) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_int_sum AS SELECT a.x, b.y, SUM(a.iv * b.jw) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_int_sum EXCEPT ALL SELECT * FROM off_int_sum) UNION ALL (SELECT * FROM off_int_sum EXCEPT ALL SELECT * FROM on_int_sum));
+----
+0
+
+query II
+EXPLAIN SELECT a.x, b.y, AVG(a.iv * b.jw) AS s, COUNT(b.w) AS c, COUNT(a.v) AS d FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_int_avg_count AS SELECT a.x, b.y, AVG(a.iv * b.jw) AS s, COUNT(b.w) AS c, COUNT(a.v) AS d FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_int_avg_count AS SELECT a.x, b.y, AVG(a.iv * b.jw) AS s, COUNT(b.w) AS c, COUNT(a.v) AS d FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_int_avg_count EXCEPT ALL SELECT * FROM off_int_avg_count) UNION ALL (SELECT * FROM off_int_avg_count EXCEPT ALL SELECT * FROM on_int_avg_count));
+----
+0
+
+query II
+EXPLAIN SELECT a.x, b.y, SUM(a.v) AS s, SUM(b.w) AS t, SUM(a.v * b.w) AS u FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_one_side AS SELECT a.x, b.y, SUM(a.v) AS s, SUM(b.w) AS t, SUM(a.v * b.w) AS u FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_one_side AS SELECT a.x, b.y, SUM(a.v) AS s, SUM(b.w) AS t, SUM(a.v * b.w) AS u FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_one_side EXCEPT ALL SELECT * FROM off_one_side) UNION ALL (SELECT * FROM off_one_side EXCEPT ALL SELECT * FROM on_one_side));
+----
+0
+
+query I
+SELECT count(*) > 0 FROM on_one_side WHERE s IS NULL;
+----
+true
+
+query II
+EXPLAIN SELECT a.x AS i, b.x AS j, SUM(a.v * b.v) AS s FROM r a JOIN r b ON a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_self AS SELECT a.x AS i, b.x AS j, SUM(a.v * b.v) AS s FROM r a JOIN r b ON a.k = b.k GROUP BY a.x, b.x;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_self AS SELECT a.x AS i, b.x AS j, SUM(a.v * b.v) AS s FROM r a JOIN r b ON a.k = b.k GROUP BY a.x, b.x;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_self EXCEPT ALL SELECT * FROM off_self) UNION ALL (SELECT * FROM off_self EXCEPT ALL SELECT * FROM on_self));
+----
+0
+
+query I
+SELECT count(*) > 0 FROM on_self WHERE s IS NULL;
+----
+true
+
+query II
+EXPLAIN SELECT a.x AS i, b.x AS j, SUM(a.v * b.v) AS s FROM r a JOIN r b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_self_lt AS SELECT a.x AS i, b.x AS j, SUM(a.v * b.v) AS s FROM r a JOIN r b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_self_lt AS SELECT a.x AS i, b.x AS j, SUM(a.v * b.v) AS s FROM r a JOIN r b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_self_lt EXCEPT ALL SELECT * FROM off_self_lt) UNION ALL (SELECT * FROM off_self_lt EXCEPT ALL SELECT * FROM on_self_lt));
+----
+0
+
+query I
+SELECT count(*) > 0 FROM on_self_lt WHERE s IS NULL;
+----
+true
+
+query II
+EXPLAIN SELECT a.x, b.y, SUM(a.v * b.w) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y HAVING SUM(a.v * b.w) > 20;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_having AS SELECT a.x, b.y, SUM(a.v * b.w) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y HAVING SUM(a.v * b.w) > 20;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_having AS SELECT a.x, b.y, SUM(a.v * b.w) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y HAVING SUM(a.v * b.w) > 20;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_having EXCEPT ALL SELECT * FROM off_having) UNION ALL (SELECT * FROM off_having EXCEPT ALL SELECT * FROM on_having));
+----
+0
+
+query II
+EXPLAIN SELECT a.x, b.y, SUM(a.iv * b.jw) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y ORDER BY s DESC, a.x, b.y LIMIT 25;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_top_k AS SELECT a.x, b.y, SUM(a.iv * b.jw) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y ORDER BY s DESC, a.x, b.y LIMIT 25;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_top_k AS SELECT a.x, b.y, SUM(a.iv * b.jw) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y ORDER BY s DESC, a.x, b.y LIMIT 25;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_top_k EXCEPT ALL SELECT * FROM off_top_k) UNION ALL (SELECT * FROM off_top_k EXCEPT ALL SELECT * FROM on_top_k));
+----
+0
+
+query II
+EXPLAIN SELECT x, y, s FROM (SELECT a.x, b.y, SUM(a.iv * b.jw) AS s, RANK() OVER (PARTITION BY a.x ORDER BY SUM(a.iv * b.jw) DESC) AS rn FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y) WHERE rn <= 3;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_rank AS SELECT x, y, s FROM (SELECT a.x, b.y, SUM(a.iv * b.jw) AS s, RANK() OVER (PARTITION BY a.x ORDER BY SUM(a.iv * b.jw) DESC) AS rn FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y) WHERE rn <= 3;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_rank AS SELECT x, y, s FROM (SELECT a.x, b.y, SUM(a.iv * b.jw) AS s, RANK() OVER (PARTITION BY a.x ORDER BY SUM(a.iv * b.jw) DESC) AS rn FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y) WHERE rn <= 3;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_rank EXCEPT ALL SELECT * FROM off_rank) UNION ALL (SELECT * FROM off_rank EXCEPT ALL SELECT * FROM on_rank));
+----
+0
+
+query II
+EXPLAIN SELECT a.xn, b.y, SUM(a.v * b.w) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.xn, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_null_groups AS SELECT a.xn, b.y, SUM(a.v * b.w) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.xn, b.y;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_null_groups AS SELECT a.xn, b.y, SUM(a.v * b.w) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.xn, b.y;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_null_groups EXCEPT ALL SELECT * FROM off_null_groups) UNION ALL (SELECT * FROM off_null_groups EXCEPT ALL SELECT * FROM on_null_groups));
+----
+0
+
+query II
+EXPLAIN SELECT a.xs, b.y, SUM(a.v * b.w) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.xs, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_strings AS SELECT a.xs, b.y, SUM(a.v * b.w) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.xs, b.y;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_strings AS SELECT a.xs, b.y, SUM(a.v * b.w) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.xs, b.y;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_strings EXCEPT ALL SELECT * FROM off_strings) UNION ALL (SELECT * FROM off_strings EXCEPT ALL SELECT * FROM on_strings));
+----
+0
+
+query I
+SELECT count(*) > 0 FROM on_strings WHERE s IS NULL;
+----
+true
+
+query II
+EXPLAIN SELECT a.x, b.y, SUM(a.v * b.w) AS s FROM read_csv('{TEST_DIR}/nulls_r.csv') a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_csv AS SELECT a.x, b.y, SUM(a.v * b.w) AS s FROM read_csv('{TEST_DIR}/nulls_r.csv') a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_csv AS SELECT a.x, b.y, SUM(a.v * b.w) AS s FROM read_csv('{TEST_DIR}/nulls_r.csv') a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_csv EXCEPT ALL SELECT * FROM off_csv) UNION ALL (SELECT * FROM off_csv EXCEPT ALL SELECT * FROM on_csv));
+----
+0
+
+query I
+SELECT count(*) > 0 FROM on_csv WHERE s IS NULL;
+----
+true
+
+statement ok
+CREATE TABLE ov_a AS SELECT * FROM (VALUES (1, 1, 2000000000), (2, 1, 3), (3, 2, 5)) t(k, x, big);
+
+statement ok
+CREATE TABLE ov_b AS SELECT * FROM (VALUES (1, 1, NULL::INTEGER), (2, 1, 2), (1, 2, NULL), (3, 2, 7), (3, 1, NULL)) t(k, y, big);
+
+query II
+EXPLAIN SELECT a.x, b.y, SUM(a.big * b.big) AS s FROM ov_a a JOIN ov_b b ON a.k = b.k GROUP BY a.x, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_overflow_only_with_nulls AS SELECT a.x, b.y, SUM(a.big * b.big) AS s FROM ov_a a JOIN ov_b b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_overflow_only_with_nulls AS SELECT a.x, b.y, SUM(a.big * b.big) AS s FROM ov_a a JOIN ov_b b ON a.k = b.k GROUP BY a.x, b.y;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_overflow_only_with_nulls EXCEPT ALL SELECT * FROM off_overflow_only_with_nulls) UNION ALL (SELECT * FROM off_overflow_only_with_nulls EXCEPT ALL SELECT * FROM on_overflow_only_with_nulls));
+----
+0
+
+statement error
+SELECT a.x, b.y, SUM(a.big * b.big) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+----
+Overflow in multiplication of INT32
+
+statement ok
+SET tessera_enabled = false;
+
+statement error
+SELECT a.x, b.y, SUM(a.big * b.big) AS s FROM r a JOIN s b ON a.k = b.k GROUP BY a.x, b.y;
+----
+Overflow in multiplication of INT32
+
+statement ok
+SET tessera_enabled = true;
+
+query II
+EXPLAIN SELECT a.x AS i, b.x AS j, SUM(a.iv * b.iv) AS s FROM r a JOIN r b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_int_self_lt AS SELECT a.x AS i, b.x AS j, SUM(a.iv * b.iv) AS s FROM r a JOIN r b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_int_self_lt AS SELECT a.x AS i, b.x AS j, SUM(a.iv * b.iv) AS s FROM r a JOIN r b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_int_self_lt EXCEPT ALL SELECT * FROM off_int_self_lt) UNION ALL (SELECT * FROM off_int_self_lt EXCEPT ALL SELECT * FROM on_int_self_lt));
+----
+0
+
+statement ok
+CREATE TABLE rk AS SELECT k, x, (hash(k * 3 + x) % 9)::BIGINT AS w FROM r;
+
+query II
+EXPLAIN SELECT a.x AS i, b.x AS j, SUM(a.w * b.w) AS s, SUM(a.w) AS t, COUNT(*) AS c FROM rk a JOIN rk b ON a.k = b.k AND a.x <> b.x GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE on_int_many_ne AS SELECT a.x AS i, b.x AS j, SUM(a.w * b.w) AS s, SUM(a.w) AS t, COUNT(*) AS c FROM rk a JOIN rk b ON a.k = b.k AND a.x <> b.x GROUP BY a.x, b.x;
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE off_int_many_ne AS SELECT a.x AS i, b.x AS j, SUM(a.w * b.w) AS s, SUM(a.w) AS t, COUNT(*) AS c FROM rk a JOIN rk b ON a.k = b.k AND a.x <> b.x GROUP BY a.x, b.x;
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM on_int_many_ne EXCEPT ALL SELECT * FROM off_int_many_ne) UNION ALL (SELECT * FROM off_int_many_ne EXCEPT ALL SELECT * FROM on_int_many_ne));
+----
+0
+
+statement ok
+CREATE TABLE ovf AS SELECT * FROM (VALUES (1, 1, 2000000000), (1, 2, 1), (1, 3, NULL::INTEGER)) t(k, x, big);
+
+statement ok
+CREATE TABLE ovh AS SELECT * FROM (VALUES (1, 1, 2000000000), (1, 2, 1)) t(k, x, big);
+
+query II
+EXPLAIN SELECT a.x AS i, b.x AS j, SUM(a.big * b.big) AS s FROM ovf a JOIN ovf b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query III
+SELECT a.x AS i, b.x AS j, SUM(a.big * b.big) AS s FROM ovf a JOIN ovf b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x ORDER BY i, j;
+----
+1	2	2000000000
+1	3	NULL
+2	3	NULL
+
+query II
+EXPLAIN SELECT a.x AS i, b.x AS j, SUM(a.big * b.big) AS s, SUM(a.big) AS t FROM ovh a JOIN ovh b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query IIII
+SELECT a.x AS i, b.x AS j, SUM(a.big * b.big) AS s, SUM(a.big) AS t FROM ovh a JOIN ovh b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x;
+----
+1	2	2000000000	2000000000
+
+statement ok
+CREATE TABLE ovg AS SELECT * FROM (VALUES (1, 1, 3), (1, 2, 2000000000), (1, 3, NULL::INTEGER)) t(k, x, big);
+
+query II
+EXPLAIN SELECT a.x AS i, b.x AS j, SUM(a.big * b.big) AS s FROM ovg a JOIN ovg b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement error
+SELECT a.x AS i, b.x AS j, SUM(a.big * b.big) AS s FROM ovg a JOIN ovg b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x;
+----
+Overflow in multiplication of INT32
+
+statement ok
+SET tessera_enabled = false;
+
+statement error
+SELECT a.x AS i, b.x AS j, SUM(a.big * b.big) AS s FROM ovg a JOIN ovg b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x;
+----
+Overflow in multiplication of INT32
+
+query III
+SELECT a.x AS i, b.x AS j, SUM(a.big * b.big) AS s FROM ovf a JOIN ovf b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x ORDER BY i, j;
+----
+1	2	2000000000
+1	3	NULL
+2	3	NULL
+
+statement ok
+SET tessera_enabled = true;
+
+statement ok
+CREATE TABLE ca AS SELECT * FROM (VALUES (1, 1, 100000::INTEGER), (1, 2, NULL::INTEGER)) t(k, x, iv);
+
+statement ok
+CREATE TABLE cb AS SELECT * FROM (VALUES (1, 1, 100000::INTEGER, 2.5::DOUBLE), (1, 2, 3::INTEGER, NULL)) t(k, y, iw, w);
+
+statement error
+SELECT a.x, b.y, COUNT(a.iv * b.iw) FROM ca a JOIN cb b ON a.k = b.k GROUP BY a.x, b.y;
+----
+Overflow in multiplication of INT32
+
+query II
+EXPLAIN SELECT a.x, b.y, SUM(a.iv * b.iw), COUNT(a.iv * b.iw) FROM ca a JOIN cb b ON a.k = b.k GROUP BY a.x, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement error
+SELECT a.x, b.y, SUM(a.iv * b.iw), COUNT(a.iv * b.iw) FROM ca a JOIN cb b ON a.k = b.k GROUP BY a.x, b.y;
+----
+Overflow in multiplication of INT32
+
+query II
+EXPLAIN SELECT a.x, b.y, SUM(a.iv * b.w), AVG(a.iv * b.w) FROM ca a JOIN cb b ON a.k = b.k GROUP BY a.x, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query IIII
+SELECT a.x, b.y, SUM(a.iv * b.w), AVG(a.iv * b.w) FROM ca a JOIN cb b ON a.k = b.k GROUP BY a.x, b.y ORDER BY 1, 2;
+----
+1	1	250000.0	250000.0
+1	2	NULL	NULL
+2	1	NULL	NULL
+2	2	NULL	NULL
+
+query II
+EXPLAIN SELECT a.x, b.y, COUNT(a.iv * b.w) FROM ca a JOIN cb b ON a.k = b.k GROUP BY a.x, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query III
+SELECT a.x, b.y, COUNT(a.iv * b.w) FROM ca a JOIN cb b ON a.k = b.k GROUP BY a.x, b.y ORDER BY 1, 2;
+----
+1	1	1
+1	2	0
+2	1	0
+2	2	0

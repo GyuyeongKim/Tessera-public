@@ -2,7 +2,9 @@
 #include "tessera_extension.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
@@ -18,11 +20,15 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
@@ -33,11 +39,18 @@
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/function/partition_stats.hpp"
+#include "duckdb/parallel/thread_context.hpp"
 #include "tessera_operator.hpp"
 #include "tessera.hpp"
 
 #include <cmath>
+#include <functional>
+#include <unordered_map>
 #include <cstdio>
 #include <cstdlib>
 
@@ -509,6 +522,8 @@ static bool AllComparisons(const LogicalComparisonJoin &join) {
 struct TesseraPushdown {
 	uint64_t min_value = 0;
 	int64_t topk = -1;
+	int64_t group_topk = -1;
+	vector<idx_t> group_cols;
 };
 
 static bool SameTableFilters(LogicalGet &a, LogicalGet &b) {
@@ -554,12 +569,48 @@ static bool IsFinalize(const Expression &e) {
 	       e.Cast<BoundFunctionExpression>().GetChildren().size() == 1;
 }
 
+static bool ThrowsOnCell(const Expression &e) {
+	bool kids = false, kids_duck = false;
+	ExpressionIterator::EnumerateChildren(e, [&](const Expression &c) {
+		kids = kids || ThrowsOnCell(c);
+		kids_duck = kids_duck || c.CanThrow();
+	});
+	if (kids) {
+		return true;
+	}
+	if (e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		auto &f = e.Cast<BoundFunctionExpression>();
+		const auto &name = f.Function().GetName();
+		if (name == "finalize" || name == "__internal_compressed_materialization_cast" ||
+		    name == "__internal_decompress_string" || name.StartsWith("__internal_compress_string_") || name.StartsWith("__internal_compress_integral_") ||
+		    name.StartsWith("__internal_decompress_integral_")) {
+			return false;
+		}
+		if (f.Function().GetErrorMode() == FunctionErrors::CAN_THROW_RUNTIME_ERROR || f.Function().HasBindLambdaCallback()) {
+			return true;
+		}
+	}
+	return e.CanThrow() && !kids_duck;
+}
+
+static bool AnyThrows(const vector<unique_ptr<Expression>> &exprs) {
+	for (auto &e : exprs) {
+		if (ThrowsOnCell(*e)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static unique_ptr<LogicalOperator> *AggregateBelow(LogicalOperator &op, ColumnBinding b, bool &is_value) {
 	is_value = false;
 	unique_ptr<LogicalOperator> *slot = &op.children[0];
 	bool track = true;
 	while ((*slot)->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		auto &proj = (*slot)->Cast<LogicalProjection>();
+		if (AnyThrows(proj.expressions)) {
+			return nullptr;
+		}
 		if (track) {
 			const Expression *e = b.table_index == proj.table_index && b.column_index < proj.expressions.size()
 			                          ? proj.expressions[b.column_index].get()
@@ -585,6 +636,9 @@ static unique_ptr<LogicalOperator> *AggregateBelow(LogicalOperator &op, ColumnBi
 
 static unique_ptr<LogicalOperator> *HavingBelow(LogicalFilter &filter, TesseraPushdown &push) {
 	unique_ptr<LogicalOperator> *slot = nullptr;
+	if (AnyThrows(filter.expressions)) {
+		return nullptr;
+	}
 	for (auto &e : filter.expressions) {
 		if (!BoundComparisonExpression::IsComparison(*e)) {
 			continue;
@@ -626,6 +680,11 @@ static unique_ptr<LogicalOperator> *TopNBelow(LogicalTopN &top, TesseraPushdown 
 	    top.orders[0].expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 		return nullptr;
 	}
+	for (auto &o : top.orders) {
+		if (ThrowsOnCell(*o.expression)) {
+			return nullptr;
+		}
+	}
 	bool is_value;
 	auto s = AggregateBelow(top, top.orders[0].expression->Cast<BoundColumnRefExpression>().Binding(), is_value);
 	const idx_t imax = (idx_t)NumericLimits<int64_t>::Maximum();
@@ -636,8 +695,191 @@ static unique_ptr<LogicalOperator> *TopNBelow(LogicalTopN &top, TesseraPushdown 
 	return s;
 }
 
+static idx_t GroupBelow(LogicalOperator &op, const Expression &e) {
+	const Expression *cur = &e;
+	LogicalOperator *child = op.children[0].get();
+	auto plain = [](const Expression *x) {
+		while (x->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+			auto &f = x->Cast<BoundFunctionExpression>();
+			const string &name = f.Function().GetName().GetIdentifierName();
+			if ((!StringUtil::StartsWith(name, "__internal_decompress_integral_") && name != "__internal_decompress_string" &&
+			     name != "__internal_compressed_materialization_cast") ||
+			    f.GetChildren().empty()) {
+				return x;
+			}
+			x = f.GetChildren()[0].get();
+		}
+		return x;
+	};
+	while (child->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		cur = plain(cur);
+		if (cur->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return DConstants::INVALID_INDEX;
+		}
+		auto &proj = child->Cast<LogicalProjection>();
+		auto &b = cur->Cast<BoundColumnRefExpression>().Binding();
+		if (b.table_index != proj.table_index || b.column_index >= proj.expressions.size()) {
+			return DConstants::INVALID_INDEX;
+		}
+		cur = proj.expressions[b.column_index].get();
+		child = child->children[0].get();
+	}
+	cur = plain(cur);
+	if (child->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY ||
+	    cur->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return DConstants::INVALID_INDEX;
+	}
+	auto &agg = child->Cast<LogicalAggregate>();
+	auto &b = cur->Cast<BoundColumnRefExpression>().Binding();
+	return b.table_index == agg.group_index && b.column_index < agg.groups.size() ? idx_t(b.column_index)
+	                                                                              : DConstants::INVALID_INDEX;
+}
+
+static bool GroupsBelow(LogicalOperator &op, const vector<unique_ptr<Expression>> &partition, vector<idx_t> &cols) {
+	for (auto &p : partition) {
+		const idx_t c = GroupBelow(op, *p);
+		if (c == DConstants::INVALID_INDEX) {
+			return false;
+		}
+		cols.push_back(c);
+	}
+	return !cols.empty();
+}
+
+static unique_ptr<LogicalOperator> *WindowTopBelow(LogicalFilter &filter, TesseraPushdown &push) {
+	if (AnyThrows(filter.expressions)) {
+		return nullptr;
+	}
+	for (auto &e : filter.expressions) {
+		if (!BoundComparisonExpression::IsComparison(*e)) {
+			continue;
+		}
+		auto &cmp = e->Cast<BoundFunctionExpression>();
+		const Expression *col = &BoundComparisonExpression::Left(cmp), *cst = &BoundComparisonExpression::Right(cmp);
+		ExpressionType t = cmp.GetExpressionType();
+		if (col->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			std::swap(col, cst);
+			t = FlipComparisonExpression(t);
+		}
+		if (col->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+		    cst->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			continue;
+		}
+		auto &v = cst->Cast<BoundConstantExpression>().GetValue();
+		if (v.IsNull() || !v.type().IsNumeric()) {
+			continue;
+		}
+		const double c = v.GetValue<double>();
+		double limit = -1;
+		if (t == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
+			limit = std::floor(c);
+		} else if (t == ExpressionType::COMPARE_LESSTHAN) {
+			limit = std::ceil(c) - 1;
+		} else if (t == ExpressionType::COMPARE_EQUAL && c == 1) {
+			limit = 1;
+		}
+		if (limit < 1 || limit >= 0x1p53) {
+			continue;
+		}
+		ColumnBinding b = col->Cast<BoundColumnRefExpression>().Binding();
+		LogicalOperator *op = filter.children[0].get();
+		while (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &proj = op->Cast<LogicalProjection>();
+			if (AnyThrows(proj.expressions) || b.table_index != proj.table_index ||
+			    b.column_index >= proj.expressions.size() ||
+			    proj.expressions[b.column_index]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				return nullptr;
+			}
+			b = proj.expressions[b.column_index]->Cast<BoundColumnRefExpression>().Binding();
+			op = op->children[0].get();
+		}
+		if (op->type != LogicalOperatorType::LOGICAL_WINDOW) {
+			continue;
+		}
+		auto &win = op->Cast<LogicalWindow>();
+		if (b.table_index != win.window_index || win.expressions.size() != 1 ||
+		    (win.expressions[0]->GetExpressionType() != ExpressionType::WINDOW_ROW_NUMBER &&
+		     win.expressions[0]->GetExpressionType() != ExpressionType::WINDOW_RANK)) {
+			continue;
+		}
+		auto &w = win.expressions[0]->Cast<BoundWindowExpression>();
+		if (w.Filter() || !w.ArgOrders().empty() || w.OrderBy().empty() || w.OrderBy()[0].type != OrderType::DESCENDING ||
+		    w.OrderBy()[0].expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			continue;
+		}
+		bool later_throws = false;
+		for (auto &o : w.OrderBy()) {
+			later_throws = later_throws || ThrowsOnCell(*o.expression);
+		}
+		if (later_throws) {
+			continue;
+		}
+		bool is_value;
+		auto s = AggregateBelow(win, w.OrderBy()[0].expression->Cast<BoundColumnRefExpression>().Binding(), is_value);
+		vector<idx_t> cols;
+		if (!s || !is_value || !GroupsBelow(win, w.Partitions(), cols)) {
+			continue;
+		}
+		push.group_topk = (int64_t)limit;
+		push.group_cols = std::move(cols);
+		return s;
+	}
+	return nullptr;
+}
+
+static unique_ptr<LogicalOperator> *ArgMaxTopBelow(LogicalAggregate &top, TesseraPushdown &push) {
+	if (top.expressions.size() != 1 || top.groups.empty() || top.grouping_sets.size() > 1 ||
+	    !top.grouping_functions.empty() || top.expressions[0]->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+		return nullptr;
+	}
+	auto &a = top.expressions[0]->Cast<BoundAggregateExpression>();
+	const string &name = a.Function().GetName().GetIdentifierName();
+	const bool arg = name == "arg_max" || name == "arg_max_nulls_last";
+	auto &args = a.GetChildren();
+	if ((!arg && name != "max") || a.IsDistinct() || a.GetFilter() || a.GetOrderBys() || args.size() < 2 ||
+	    args.size() > (arg ? 3u : 2u)) {
+		return nullptr;
+	}
+	if (name == "arg_max") {
+		if (args[0]->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION ||
+		    args[0]->Cast<BoundFunctionExpression>().Function().GetName().GetIdentifierName() != "struct_pack") {
+			return nullptr;
+		}
+	}
+	if (arg && ThrowsOnCell(*args[0])) {
+		return nullptr;
+	}
+	const Expression &order = *args[arg ? 1 : 0];
+	double limit = 1;
+	if (args.size() == (arg ? 3u : 2u)) {
+		if (args.back()->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return nullptr;
+		}
+		auto &v = args.back()->Cast<BoundConstantExpression>().GetValue();
+		if (v.IsNull() || !v.type().IsNumeric()) {
+			return nullptr;
+		}
+		limit = v.GetValue<double>();
+	}
+	if (limit < 1 || limit >= 0x1p53 || order.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return nullptr;
+	}
+	bool is_value;
+	auto s = AggregateBelow(top, order.Cast<BoundColumnRefExpression>().Binding(), is_value);
+	vector<idx_t> cols;
+	if (!s || !is_value || !GroupsBelow(top, top.groups, cols)) {
+		return nullptr;
+	}
+	push.group_topk = (int64_t)limit;
+	push.group_cols = std::move(cols);
+	return s;
+}
+
 static constexpr double MIN_EXPANSION = 6.0;
 static constexpr double MIN_EXPANSION_CROSS = 6.0;
+static constexpr idx_t SAMPLE_ROWS = idx_t(1) << 18;
+static constexpr idx_t PANDAS_MORSEL_ROWS = 50 * STANDARD_VECTOR_SIZE;
+static constexpr double MIN_EXPANSION_MEASURED = 6.0;
 static double TableRows(ClientContext &context, LogicalGet &g) {
 	if (!g.function.cardinality) {
 		return -1;
@@ -670,12 +912,31 @@ static double Expansion(ClientContext &context, LogicalGet &ga, idx_t ka, Logica
 	return na * nb / (std::max(va, vb) * (na + nb));
 }
 
-static bool JoinExpands(ClientContext &context, double expansion, bool cross) {
+static double ExpansionLimit(ClientContext &context, bool cross) {
 	Value v;
 	double theta = cross ? MIN_EXPANSION_CROSS : MIN_EXPANSION;
 	if (context.TryGetCurrentSetting(cross ? "tessera_min_expansion_cross" : "tessera_min_expansion", v) && !v.IsNull()) {
 		theta = v.GetValue<double>();
 	}
+	return theta;
+}
+
+static bool MeasuredExpands(ClientContext &context, double expansion) {
+	Value v;
+	double theta = MIN_EXPANSION_MEASURED;
+	if (context.TryGetCurrentSetting("tessera_min_expansion_measured", v) && !v.IsNull()) {
+		theta = v.GetValue<double>();
+	}
+	const bool run = expansion >= theta;
+	if (getenv("TESSERA_VERBOSE")) {
+		fprintf(stderr, "tessera: %.3g joined rows per input row (measured), limit %.3g: %s\n", expansion, theta,
+		        run ? "Tessera" : "the engine's plan");
+	}
+	return run;
+}
+
+static bool JoinExpands(ClientContext &context, double expansion, bool cross) {
+	const double theta = ExpansionLimit(context, cross);
 	const bool run = theta <= 0 || expansion < 0 || expansion >= theta;
 	if (getenv("TESSERA_VERBOSE")) {
 		fprintf(stderr, "tessera: %.3g joined rows per input row (estimate), limit %.3g: %s\n", expansion, theta,
@@ -913,6 +1174,14 @@ static bool TryTessera(ClientContext &context, unique_ptr<LogicalOperator> &plan
 	}
 	info.min_value = push.min_value;
 	info.topk = push.topk;
+	if (push.group_topk > 0 && push.group_cols.size() == 1 && push.group_cols[0] < 2 && !info.distinct_only) {
+		info.group_topk = push.group_topk;
+		if (info.mode == TesseraPairMode::FULL || info.mode == TesseraPairMode::NE) {
+			info.group_of = TesseraGroupOf::EACH;
+		} else {
+			info.group_of = (push.group_cols[0] == 0) == info.col0_smaller ? TesseraGroupOf::LOWER : TesseraGroupOf::HIGHER;
+		}
+	}
 	plan = make_uniq<LogicalTessera>(std::move(agg_owned), std::move(child), std::move(info));
 	plan->ResolveOperatorTypes();
 	return true;
@@ -1007,6 +1276,405 @@ static bool InputStats(ClientContext &context, const Input &in, const ColumnBind
 		v = ColumnDistinct(context, *g, base);
 	}
 	return n >= 0 && v > 0;
+}
+
+static bool ScanReadsAgain(ClientContext &context, const LogicalGet &g) {
+	if (!g.function.function || g.function.in_out_function || !g.children.empty() || g.extra_info.sample_options) {
+		return false;
+	}
+	if (g.GetTable()) {
+		return true;
+	}
+	const string name = g.function.GetDefinition()->GetName().GetIdentifierName();
+	if (name == "pandas_scan" || name == "parquet_scan" || name == "read_parquet") {
+		return true;
+	}
+	if (name != "read_csv" && name != "read_csv_auto") {
+		return false;
+	}
+	for (auto &p : g.named_parameters) {
+		if (StringUtil::Contains(StringUtil::Lower(p.first.GetIdentifierName()), "rejects")) {
+			return false;
+		}
+	}
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto no_pipe = [&](const Value &v) {
+		return v.type().id() == LogicalTypeId::VARCHAR && !v.IsNull() && !fs.IsPipe(StringValue::Get(v));
+	};
+	if (g.parameters.size() != 1) {
+		return false;
+	}
+	if (g.parameters[0].type().id() != LogicalTypeId::LIST) {
+		return no_pipe(g.parameters[0]);
+	}
+	for (auto &v : ListValue::GetChildren(g.parameters[0])) {
+		if (!no_pipe(v)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+struct KeyCounter {
+	struct Cell {
+		hash_t hash = 0;
+		uint32_t n[2][2] = {{0, 0}, {0, 0}};
+		bool Used() const {
+			return n[0][0] || n[0][1] || n[1][0] || n[1][1];
+		}
+	};
+	vector<Cell> cells = vector<Cell>(idx_t(1) << 12);
+	idx_t used = 0;
+	Cell &Find(hash_t h) {
+		const idx_t mask = cells.size() - 1;
+		idx_t i = h & mask;
+		while (cells[i].Used() && cells[i].hash != h) {
+			i = (i + 1) & mask;
+		}
+		return cells[i];
+	}
+	void Add(hash_t h, idx_t input, idx_t half) {
+		if ((used + 1) * 2 > cells.size()) {
+			vector<Cell> old(cells.size() * 2);
+			old.swap(cells);
+			for (auto &c : old) {
+				if (c.Used()) {
+					Find(c.hash) = c;
+				}
+			}
+		}
+		Cell &c = Find(h);
+		used += c.Used() ? 0 : 1;
+		c.hash = h;
+		c.n[input][half]++;
+	}
+};
+
+struct ScanSize {
+	double rows = -1;
+	vector<idx_t> parts;
+};
+
+struct OptimizedPlan {
+	explicit OptimizedPlan(unique_ptr<LogicalOperator> &plan_p) : plan(plan_p) {
+	}
+	unique_ptr<LogicalOperator> &plan;
+	std::unordered_map<const LogicalGet *, ScanSize> sizes;
+};
+static thread_local OptimizedPlan *optimized_plan = nullptr;
+struct OptimizedPlanScope {
+	explicit OptimizedPlanScope(unique_ptr<LogicalOperator> &plan) : state(plan), outer(optimized_plan) {
+		optimized_plan = &state;
+	}
+	~OptimizedPlanScope() {
+		optimized_plan = outer;
+	}
+	OptimizedPlan state;
+	OptimizedPlan *outer;
+};
+
+static ScanSize SizeOfScan(ClientContext &context, LogicalGet &g) {
+	if (optimized_plan) {
+		auto it = optimized_plan->sizes.find(&g);
+		if (it != optimized_plan->sizes.end()) {
+			return it->second;
+		}
+	}
+	ScanSize size;
+	size.rows = TableRows(context, g);
+	const string name = g.function.GetDefinition()->GetName().GetIdentifierName();
+	auto local_path = [](const Value &v) {
+		return v.type().id() == LogicalTypeId::VARCHAR && !v.IsNull() && !FileSystem::IsRemoteFile(StringValue::Get(v));
+	};
+	bool local = g.parameters.size() == 1;
+	if (local && g.parameters[0].type().id() == LogicalTypeId::LIST) {
+		for (auto &v : ListValue::GetChildren(g.parameters[0])) {
+			local = local && local_path(v);
+		}
+	} else if (local) {
+		local = local_path(g.parameters[0]);
+	}
+	if (name == "pandas_scan" && size.rows > 0) {
+		size.parts.assign(idx_t(size.rows) / PANDAS_MORSEL_ROWS, PANDAS_MORSEL_ROWS);
+		size.parts.push_back(idx_t(size.rows) % PANDAS_MORSEL_ROWS);
+	} else if ((name == "parquet_scan" || name == "read_parquet") && g.function.get_partition_stats && local) {
+		GetPartitionStatsInput input(g.function, g.bind_data.get());
+		for (auto &stats : g.function.get_partition_stats(context, input)) {
+			size.parts.push_back(stats.count);
+		}
+	}
+	idx_t total = 0, largest = 0;
+	for (auto n : size.parts) {
+		total += n;
+		largest = MaxValue(largest, n);
+	}
+	if (total > 0) {
+		size.rows = double(total);
+	}
+	if (total <= SAMPLE_ROWS || largest * 4 >= total * 3 || g.table_filters.HasFilters() ||
+	    g.table_filters.HasMultiColumnFilters()) {
+		size.parts.clear();
+	}
+	if (optimized_plan) {
+		optimized_plan->sizes[&g] = size;
+	}
+	return size;
+}
+
+struct NoReadAhead {
+	explicit NoReadAhead(ClientContext &context)
+	    : settings(ClientConfig::GetConfig(context).user_settings), was_set(settings.IsSet(ReadAheadDepthSetting::SettingIndex)) {
+		if (was_set) {
+			context.TryGetCurrentUserSetting(ReadAheadDepthSetting::SettingIndex, depth);
+		}
+		settings.SetUserSetting(ReadAheadDepthSetting::SettingIndex, Value::BIGINT(0));
+	}
+	~NoReadAhead() {
+		if (was_set) {
+			settings.SetUserSetting(ReadAheadDepthSetting::SettingIndex, depth);
+		} else {
+			settings.ClearSetting(ReadAheadDepthSetting::SettingIndex);
+		}
+	}
+	LocalUserSettings &settings;
+	const bool was_set;
+	Value depth;
+};
+
+static void CountKeys(ClientContext &context, LogicalGet &g, const vector<idx_t> &pos, idx_t input, KeyCounter &counter,
+                      idx_t &rows, idx_t half_rows[2], bool &whole, const vector<idx_t> &parts) {
+	vector<idx_t> projection;
+	for (auto &p : g.projection_ids) {
+		projection.push_back(p);
+	}
+	unique_ptr<TableFilterSet> filters;
+	if (g.table_filters.HasFilters() || g.table_filters.HasMultiColumnFilters()) {
+		filters = g.table_filters.Copy();
+	}
+	TableFunctionInitInput init(g.bind_data.get(), g.GetColumnIds(), projection, filters.get());
+	unique_ptr<GlobalTableFunctionState> global;
+	if (g.function.init_global) {
+		unique_ptr<NoReadAhead> no_read_ahead;
+		if (!parts.empty()) {
+			no_read_ahead = make_uniq<NoReadAhead>(context);
+		}
+		global = g.function.init_global(context, init);
+	}
+	ThreadContext thread(context);
+	ExecutionContext execution(context, thread, nullptr);
+	unique_ptr<LocalTableFunctionState> local;
+	TableFunctionInput data(g.bind_data.get(), nullptr, global.get());
+	DataChunk chunk;
+	chunk.Initialize(context, g.types);
+	Vector hashes(LogicalType::HASH);
+	vector<UnifiedVectorFormat> keys(pos.size());
+	rows = 0;
+	half_rows[0] = half_rows[1] = 0;
+	whole = false;
+	auto read_chunk = [&](idx_t half) {
+		chunk.Reset();
+		data.async_result = AsyncResultType::IMPLICIT;
+		g.function.function(context, data, chunk);
+		const idx_t n = chunk.size();
+		if (n == 0) {
+			return n;
+		}
+		VectorOperations::Hash(chunk.data[pos[0]], hashes, n);
+		for (idx_t c = 0; c < pos.size(); c++) {
+			if (c > 0) {
+				VectorOperations::CombineHash(hashes, chunk.data[pos[c]], n);
+			}
+			chunk.data[pos[c]].ToUnifiedFormat(keys[c]);
+		}
+		UnifiedVectorFormat h;
+		hashes.ToUnifiedFormat(h);
+		auto hash = UnifiedVectorFormat::GetData<hash_t>(h);
+		for (idx_t r = 0; r < n; r++) {
+			bool valid = true;
+			for (auto &k : keys) {
+				valid = valid && k.validity.RowIsValid(k.sel->get_index(r));
+			}
+			if (valid) {
+				counter.Add(hash[h.sel->get_index(r)], input, half);
+			}
+		}
+		rows += n;
+		half_rows[half] += n;
+		return n;
+	};
+	if (parts.empty()) {
+		if (g.function.init_local) {
+			local = g.function.init_local(execution, init, global.get());
+		}
+		data.local_state = local.get();
+		while (rows < SAMPLE_ROWS) {
+			if (read_chunk(rows >= SAMPLE_ROWS / 2 ? 1 : 0) == 0) {
+				whole = true;
+				return;
+			}
+		}
+		return;
+	}
+	idx_t total = 0;
+	for (auto n : parts) {
+		total += n;
+	}
+	double owed = 0;
+	for (auto part_rows : parts) {
+		local = g.function.init_local(execution, init, global.get());
+		data.local_state = local.get();
+		owed += double(SAMPLE_ROWS) * double(part_rows) / double(total);
+		const idx_t half = half_rows[0] <= half_rows[1] ? 0 : 1;
+		idx_t left = part_rows;
+		while (left > 0 && owed >= double(MinValue<idx_t>(left, STANDARD_VECTOR_SIZE))) {
+			const idx_t n = read_chunk(half);
+			if (n == 0) {
+				return;
+			}
+			owed -= double(n);
+			left -= MinValue(n, left);
+		}
+	}
+}
+
+static LogicalOperator *FindCTE(LogicalOperator *op, TableIndex index) {
+	if (!op) {
+		return nullptr;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && op->Cast<LogicalMaterializedCTE>().table_index == index) {
+		return op;
+	}
+	for (auto &child : op->children) {
+		if (auto *found = FindCTE(child.get(), index)) {
+			return found;
+		}
+	}
+	return nullptr;
+}
+
+static LogicalGet *ScanOfInput(const Input &in, const vector<ColumnBinding> &keys, vector<ColumnBinding> &at_scan) {
+	at_scan = keys;
+	if (in.get) {
+		return in.get;
+	}
+	if (!in.op || in.op->type != LogicalOperatorType::LOGICAL_CTE_REF || !optimized_plan) {
+		return nullptr;
+	}
+	auto &ref = in.op->Cast<LogicalCTERef>();
+	auto *cte = FindCTE(optimized_plan->plan.get(), ref.cte_index);
+	if (!cte || cte->children.empty()) {
+		return nullptr;
+	}
+	vector<idx_t> columns;
+	for (auto &k : keys) {
+		if (k.table_index != ref.table_index) {
+			return nullptr;
+		}
+		columns.push_back(k.column_index.GetIndex());
+	}
+	LogicalOperator *cur = cte->children[0].get();
+	while (cur->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &proj = cur->Cast<LogicalProjection>();
+		auto bindings = cur->children[0]->GetColumnBindings();
+		for (auto &c : columns) {
+			if (c >= proj.expressions.size() || proj.expressions[c]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				return nullptr;
+			}
+			auto &b = proj.expressions[c]->Cast<BoundColumnRefExpression>().Binding();
+			idx_t p = 0;
+			while (p < bindings.size() && !(bindings[p] == b)) {
+				p++;
+			}
+			if (p == bindings.size()) {
+				return nullptr;
+			}
+			c = p;
+		}
+		cur = cur->children[0].get();
+	}
+	if (cur->type != LogicalOperatorType::LOGICAL_GET) {
+		return nullptr;
+	}
+	auto bindings = cur->GetColumnBindings();
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (columns[i] >= bindings.size()) {
+			return nullptr;
+		}
+		at_scan[i] = bindings[columns[i]];
+	}
+	return &cur->Cast<LogicalGet>();
+}
+
+static double MeasuredExpansion(ClientContext &context, LogicalGet &gx, const vector<ColumnBinding> &kx, LogicalGet &gy,
+                                const vector<ColumnBinding> &ky) {
+	if (!ScanReadsAgain(context, gx) || !ScanReadsAgain(context, gy) || kx.empty() || kx.size() != ky.size()) {
+		if (getenv("TESSERA_VERBOSE")) {
+			fprintf(stderr, "tessera: the rule does not read scans %s and %s\n",
+			        gx.function.GetDefinition()->GetName().GetIdentifierName().c_str(),
+			        gy.function.GetDefinition()->GetName().GetIdentifierName().c_str());
+		}
+		return -1;
+	}
+	gx.ResolveOperatorTypes();
+	gy.ResolveOperatorTypes();
+	auto positions = [](LogicalGet &g, const vector<ColumnBinding> &keys, vector<idx_t> &pos) {
+		auto bindings = g.GetColumnBindings();
+		for (auto &k : keys) {
+			idx_t p = 0;
+			while (p < bindings.size() && !(bindings[p] == k)) {
+				p++;
+			}
+			if (p == bindings.size()) {
+				return false;
+			}
+			pos.push_back(p);
+		}
+		return true;
+	};
+	vector<idx_t> px, py;
+	if (!positions(gx, kx, px) || !positions(gy, ky, py)) {
+		return -1;
+	}
+	for (idx_t c = 0; c < px.size(); c++) {
+		if (gx.types[px[c]] != gy.types[py[c]]) {
+			return -1;
+		}
+	}
+	const ScanSize size_x = SizeOfScan(context, gx), size_y = SizeOfScan(context, gy);
+	const double rows_x = size_x.rows, rows_y = size_y.rows;
+	KeyCounter counter;
+	idx_t mx, my, hx[2], hy[2];
+	bool wx, wy;
+	CountKeys(context, gx, px, 0, counter, mx, hx, wx, size_x.parts);
+	CountKeys(context, gy, py, 1, counter, my, hy, wy, size_y.parts);
+	if (getenv("TESSERA_VERBOSE")) {
+		fprintf(stderr, "tessera: partitions read a little of each: %llu and %llu\n", (unsigned long long)size_x.parts.size(),
+		        (unsigned long long)size_y.parts.size());
+	}
+	if (mx + my == 0) {
+		return 0;
+	}
+	double joined = 0, across = 0;
+	for (auto &c : counter.cells) {
+		joined += double(c.n[0][0] + c.n[0][1]) * double(c.n[1][0] + c.n[1][1]);
+		across += double(c.n[0][0]) * double(c.n[1][1]) + double(c.n[0][1]) * double(c.n[1][0]);
+	}
+	double expansion = joined / double(mx + my);
+	if (wx && wy) {
+		return expansion;
+	}
+	const bool filtered = (!wx && (gx.table_filters.HasFilters() || gx.table_filters.HasMultiColumnFilters())) ||
+	                      (!wy && (gy.table_filters.HasFilters() || gy.table_filters.HasMultiColumnFilters()));
+	const double nx = wx ? double(mx) : rows_x, ny = wy ? double(my) : rows_y;
+	if (getenv("TESSERA_VERBOSE")) {
+		fprintf(stderr, "tessera: read %llu of %.0f and %llu of %.0f rows, %.0f joined, %.0f across the halves\n",
+		        (unsigned long long)mx, nx, (unsigned long long)my, ny, joined, across);
+	}
+	const double fractions = double(hx[0]) / nx * (double(hy[1]) / ny) + double(hx[1]) / nx * (double(hy[0]) / ny);
+	if (!filtered && fractions > 0 && nx >= double(mx) && ny >= double(my)) {
+		expansion = std::max(expansion, across / fractions / (nx + ny));
+	}
+	return expansion;
 }
 
 static bool MayThrow(ClientContext &context, const Expression &e, const Input &in) {
@@ -1146,10 +1814,9 @@ static shared_ptr<Expression> CastWeight(Expression &e, const vector<Layer> &lay
 static bool IsDistinctMarker(const BoundAggregateExpression &a);
 
 static bool TryTesseraCross(ClientContext &context, unique_ptr<LogicalOperator> &plan, const TesseraPushdown &push,
-                            Binder &binder, bool opaque = false) {
+                            Binder &binder, bool opaque = false, bool null_sums = false) {
 	auto &agg = plan->Cast<LogicalAggregate>();
-	if (agg.groups.size() < 2 || agg.expressions.empty() || agg.expressions.size() > 3 || agg.grouping_sets.size() > 1 ||
-	    !agg.grouping_functions.empty()) {
+	if (agg.groups.size() < 2 || agg.expressions.empty() || agg.grouping_sets.size() > 1 || !agg.grouping_functions.empty()) {
 		return false;
 	}
 	for (auto &e : agg.expressions) {
@@ -1161,6 +1828,17 @@ static bool TryTesseraCross(ClientContext &context, unique_ptr<LogicalOperator> 
 		return agg.expressions[i]->Cast<BoundAggregateExpression>().Function().GetName() == name;
 	};
 	idx_t nsum = 0, navg = 0, main_agg = DConstants::INVALID_INDEX;
+	bool many = false;
+	struct SumFactor {
+		ColumnBinding b;
+		shared_ptr<Expression> cast;
+		LogicalType type;
+	};
+	struct ManySum {
+		vector<SumFactor> factors[2];
+	};
+	vector<ManySum> many_sums;
+	bool int_sum_filtered = false;
 	for (idx_t i = 0; i < agg.expressions.size(); i++) {
 		if (!agg_is(i, "sum") && !agg_is(i, "avg")) {
 			continue;
@@ -1173,11 +1851,16 @@ static bool TryTesseraCross(ClientContext &context, unique_ptr<LogicalOperator> 
 		auto &m = agg.expressions[main_agg]->Cast<BoundAggregateExpression>();
 		auto &e = agg.expressions[i]->Cast<BoundAggregateExpression>();
 		if (e.GetChildren().size() != 1 || m.GetChildren().size() != 1 || e.IsDistinct() || e.GetFilter() ||
-		    e.GetOrderBys() || !e.GetChildren()[0]->Equals(*m.GetChildren()[0])) {
+		    e.GetOrderBys()) {
 			return false;
 		}
+		many = many || !e.GetChildren()[0]->Equals(*m.GetChildren()[0]);
 	}
-	if (nsum > 1 || navg > 1 || (agg.expressions.size() == 3 && nsum + navg != 2)) {
+	if (null_sums) {
+		many = true;
+	}
+	if (many ? (navg > 0 && !null_sums) || agg.expressions.size() > 200
+	         : (agg.expressions.size() > 3 || nsum > 1 || navg > 1 || (agg.expressions.size() == 3 && nsum + navg != 2))) {
 		return false;
 	}
 	const bool two = agg.expressions.size() >= 2 || navg > 0;
@@ -1394,7 +2077,7 @@ static bool TryTesseraCross(ClientContext &context, unique_ptr<LogicalOperator> 
 	}
 	const bool eager = scan_l.eager || scan_r.eager;
 	const EagerAgg ea = eager ? EagerCount(ae, projs, scan_l, scan_r) : EagerAgg();
-	if (eager && !ea.ok) {
+	if ((eager && !ea.ok) || (eager && many)) {
 		return false;
 	}
 	info.agg_type = eager ? LogicalType::BIGINT : ae.GetReturnType();
@@ -1427,7 +2110,10 @@ static bool TryTesseraCross(ClientContext &context, unique_ptr<LogicalOperator> 
 		vt[side] = cast ? cast->GetReturnType() : ve->GetReturnType();
 		return IsExactWeight(vt[side]) || vt[side].id() == LogicalTypeId::DOUBLE || vt[side].id() == LogicalTypeId::FLOAT;
 	};
-	if (eager && ea.sum) {
+	if (many) {
+		info.has_value = false;
+		info.agg_type = LogicalType::BIGINT;
+	} else if (eager && ea.sum) {
 		int s;
 		idx_t c;
 		ColumnBinding b;
@@ -1502,6 +2188,169 @@ static bool TryTesseraCross(ClientContext &context, unique_ptr<LogicalOperator> 
 		info.agg2_type = info.agg_type;
 		info.agg_type = LogicalType::BIGINT;
 		info.count_first = false;
+	} else if (many) {
+		for (idx_t i = 0; i < agg.expressions.size(); i++) {
+			auto &e = agg.expressions[i]->Cast<BoundAggregateExpression>();
+			if (e.IsDistinct() || e.GetFilter() || e.GetOrderBys()) {
+				return false;
+			}
+			if (e.Function().GetName() == "count_star" && e.GetChildren().empty()) {
+				info.aggs.push_back(0);
+				continue;
+			}
+			const bool is_avg = e.Function().GetName() == "avg";
+			const bool is_count = null_sums && e.Function().GetName() == "count";
+			if ((e.Function().GetName() != "sum" && !(null_sums && is_avg) && !is_count) || e.GetChildren().size() != 1) {
+				return false;
+			}
+			TesseraSum ts;
+			ManySum ms;
+			bool sum_has_null = false;
+			if (is_count) {
+				ts.kind = TesseraSum::COUNT;
+				ts.ones = true;
+				ts.sum_type = LogicalType::BIGINT;
+			} else if (is_avg) {
+				const LogicalType at = e.GetChildren()[0]->GetReturnType();
+				if (IsIntegerKey(at)) {
+					ts.sum_type = LogicalType::HUGEINT;
+				} else if (at.id() == LogicalTypeId::DOUBLE) {
+					ts.sum_type = LogicalType::DOUBLE;
+				} else {
+					return false;
+				}
+				ts.kind = TesseraSum::AVG;
+				ts.avg_input = at;
+			} else {
+				ts.sum_type = e.GetReturnType();
+			}
+			const auto rt = ts.sum_type.InternalType();
+			ts.v_int = rt == PhysicalType::INT64 || rt == PhysicalType::INT128;
+			if (!ts.v_int && ts.sum_type.id() != LogicalTypeId::DOUBLE) {
+				return false;
+			}
+			auto is_mul = [&](Expression &x, vector<Layer> &layers, vector<Layer> &under) -> BoundFunctionExpression * {
+				Expression *d = Defined(x, layers, under);
+				if (d->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION ||
+				    d->Cast<BoundFunctionExpression>().Function().GetName() != "*" ||
+				    d->Cast<BoundFunctionExpression>().GetChildren().size() != 2) {
+					return nullptr;
+				}
+				return &d->Cast<BoundFunctionExpression>();
+			};
+			auto factor = [&](Expression &x, vector<Layer> &layers) -> int {
+				int64_t voff = 0;
+				auto ve = ToScan(ThroughProjections(WithoutDecimalWidening(x), layers, &voff), scan_l, scan_r, false, &voff);
+				int side_of;
+				idx_t c;
+				ColumnBinding b;
+				shared_ptr<Expression> cast;
+				if (voff != 0 || !ve || !SideOf(*ve, gl, gr, side_of, c, b)) {
+					cast = CastWeight(x, layers, scan_l, scan_r, gl, gr, side_of, b);
+					if (!cast) {
+						return -1;
+					}
+				}
+				const LogicalType t = cast ? cast->GetReturnType() : ve->GetReturnType();
+				if (!NoNulls(context, side_of == 0 ? gl : gr, InputColumn(side_of == 0 ? gl : gr, b))) {
+					if (!null_sums) {
+						return -1;
+					}
+					sum_has_null = true;
+				}
+				if (!ts.ones &&
+				    (ts.v_int ? !IsIntegerKey(t) : !(t.id() == LogicalTypeId::DOUBLE || t.id() == LogicalTypeId::FLOAT || IsIntegerKey(t)))) {
+					return -1;
+				}
+				const int slot = side_of == sx ? 0 : 1;
+				ms.factors[slot].push_back({b, cast, t});
+				return slot;
+			};
+			std::function<int(Expression &, vector<Layer> &)> chain = [&](Expression &x, vector<Layer> &layers) -> int {
+				vector<Layer> under;
+				auto *mul = is_mul(x, layers, under);
+				if (!mul) {
+					return factor(x, layers);
+				}
+				auto *l = mul->GetChildren()[0].get(), *r = mul->GetChildren()[1].get();
+				vector<Layer> u1, u2;
+				if (is_mul(*r, under, u1)) {
+					std::swap(l, r);
+				}
+				if (is_mul(*r, under, u2)) {
+					return -1;
+				}
+				const int a = chain(*l, under), b = a < 0 ? -1 : factor(*r, under);
+				return a == b ? a : -1;
+			};
+			std::function<bool(Expression &, vector<Layer> &)> collect = [&](Expression &x, vector<Layer> &layers) -> bool {
+				if (chain(x, layers) >= 0) {
+					return true;
+				}
+				ms.factors[0].clear();
+				ms.factors[1].clear();
+				vector<Layer> under;
+				auto *mul = is_mul(x, layers, under);
+				if (!mul) {
+					return false;
+				}
+				const int a = chain(*mul->GetChildren()[0], under), b = a < 0 ? -1 : chain(*mul->GetChildren()[1], under);
+				return a >= 0 && b >= 0 && a != b;
+			};
+			vector<Layer> top;
+			Expression *def = Defined(*e.GetChildren()[0], projs, top);
+			ts.prod_type = ts.ones ? LogicalType::BIGINT : def->GetReturnType();
+			if (!collect(*e.GetChildren()[0], projs) || ms.factors[0].size() + ms.factors[1].size() == 0 ||
+			    (ts.v_int && !ts.ones && (ms.factors[0].size() > 1 || ms.factors[1].size() > 1))) {
+				return false;
+			}
+			if (ts.ones && ms.factors[0].size() + ms.factors[1].size() > 1) {
+				bool exact = false;
+				for (idx_t s = 0; s < 2; s++) {
+					for (auto &f : ms.factors[s]) {
+						exact = exact || (f.type.id() != LogicalTypeId::DOUBLE && f.type.id() != LogicalTypeId::FLOAT);
+					}
+				}
+				bool summed = false;
+				for (auto &o : agg.expressions) {
+					auto &oa = o->Cast<BoundAggregateExpression>();
+					const bool sum_or_avg = oa.Function().GetName() == "sum" || oa.Function().GetName() == "avg";
+					summed = summed || (sum_or_avg && oa.GetChildren().size() == 1 &&
+					                    oa.GetChildren()[0]->Equals(*e.GetChildren()[0]));
+				}
+				if (exact && !summed) {
+					return false;
+				}
+			}
+			int_sum_filtered = int_sum_filtered || (ts.v_int && !ts.ones && !info.filters.empty());
+			if (is_count && !sum_has_null) {
+				info.aggs.push_back(0);
+				continue;
+			}
+			info.sum_nulls = info.sum_nulls || sum_has_null;
+			ts.factors[0] = ms.factors[0].size();
+			ts.factors[1] = ms.factors[1].size();
+			info.aggs.push_back((uint8_t)(3 + info.sums.size()));
+			info.sums.push_back(std::move(ts));
+			many_sums.push_back(std::move(ms));
+			if (is_avg) {
+				TesseraSum h;
+				h.kind = TesseraSum::HIDDEN;
+				h.v_int = true;
+				h.sum_type = h.prod_type = LogicalType::BIGINT;
+				h.null_like = (int64_t)info.sums.size() - 1;
+				info.sums.back().div = info.sums.size();
+				info.sums.push_back(std::move(h));
+				many_sums.push_back(ManySum());
+			}
+		}
+		if (null_sums && !info.sum_nulls) {
+			return false;
+		}
+		if (info.sum_nulls && info.sums.size() > 64) {
+			return false;
+		}
+		info.count_first = info.aggs[0] == 0;
 	} else if (info.two) {
 		if (!info.has_value || info.distinct_keys) {
 			return false;
@@ -1601,6 +2450,9 @@ static bool TryTesseraCross(ClientContext &context, unique_ptr<LogicalOperator> 
 		}
 		nullable = nullable || col.nullable || groups[g].text;
 	}
+	if (int_sum_filtered && info.ManyPairOp() == 0) {
+		return false;
+	}
 	for (idx_t s = 0; s < 2 && info.has_value; s++) {
 		if (has_w[s] && !NoNulls(context, s == 0 ? gx : gy, InputColumn(s == 0 ? gx : gy, vb[s]))) {
 			return false;
@@ -1615,17 +2467,47 @@ static bool TryTesseraCross(ClientContext &context, unique_ptr<LogicalOperator> 
 			expansion = na * nb / (std::max(va, vb) * (na + nb));
 		}
 	}
-	if (expansion < 0 && join.has_estimated_cardinality && join.children[0]->has_estimated_cardinality &&
-	    join.children[1]->has_estimated_cardinality &&
-	    join.children[0]->estimated_cardinality + join.children[1]->estimated_cardinality > 0) {
-		expansion = (double)join.estimated_cardinality /
-		            (double)(join.children[0]->estimated_cardinality + join.children[1]->estimated_cardinality);
+	bool measured = false;
+	if (expansion < 0 && !scan_l.filter && !scan_r.filter && ExpansionLimit(context, true) > 0) {
+		bool plain = true;
+		for (idx_t c = 0; c < info.nk; c++) {
+			plain = plain && !kxe[c] && !kye[c];
+		}
+		vector<ColumnBinding> skx, sky;
+		LogicalGet *sgx = plain ? ScanOfInput(gx, kx, skx) : nullptr, *sgy = plain ? ScanOfInput(gy, ky, sky) : nullptr;
+		if (sgx && sgy) {
+			double m = -1;
+			try {
+				m = MeasuredExpansion(context, *sgx, skx, *sgy, sky);
+			} catch (InterruptException &) {
+				throw;
+			} catch (std::exception &e) {
+				m = -1;
+				if (getenv("TESSERA_VERBOSE")) {
+					fprintf(stderr, "tessera: the rule could not read the inputs: %s\n", e.what());
+				}
+			}
+			if (m >= 0) {
+				measured = true;
+				if (!MeasuredExpands(context, m)) {
+					return false;
+				}
+			}
+		}
 	}
-	if (!JoinExpands(context, expansion, true)) {
-		return false;
+	if (!measured) {
+		if (expansion < 0 && join.has_estimated_cardinality && join.children[0]->has_estimated_cardinality &&
+		    join.children[1]->has_estimated_cardinality &&
+		    join.children[0]->estimated_cardinality + join.children[1]->estimated_cardinality > 0) {
+			expansion = (double)join.estimated_cardinality /
+			            (double)(join.children[0]->estimated_cardinality + join.children[1]->estimated_cardinality);
+		}
+		if (!JoinExpands(context, expansion, true)) {
+			return false;
+		}
 	}
-	info.general_cross =
-	    info.nk > 1 || info.xcols.size() > 1 || info.ycols.size() > 1 || !info.filters.empty() || info.two || nullable;
+	info.general_cross = info.nk > 1 || info.xcols.size() > 1 || info.ycols.size() > 1 || !info.filters.empty() || info.two ||
+	                     nullable || !info.sums.empty();
 	{
 		vector<ColumnBinding> xb, yb;
 		bool computed = false;
@@ -1636,7 +2518,7 @@ static bool TryTesseraCross(ClientContext &context, unique_ptr<LogicalOperator> 
 		auto same = [&](ColumnBinding a, ColumnBinding b) {
 			return InputColumn(gx, a) == InputColumn(gy, b);
 		};
-		bool sym = info.general_cross && !computed && gx.get && gy.get && gx.get->GetTable() &&
+		bool sym = !many && info.general_cross && !computed && gx.get && gy.get && gx.get->GetTable() &&
 		           gx.get->GetTable().get() == gy.get->GetTable().get() &&
 		           SameTableFilters(*gx.get, *gy.get) && !scan_l.filter &&
 		           !scan_r.filter && !gx.get->extra_info.sample_options && !gy.get->extra_info.sample_options && !eager &&
@@ -1706,6 +2588,22 @@ static bool TryTesseraCross(ClientContext &context, unique_ptr<LogicalOperator> 
 				}
 			}
 		}
+		for (idx_t m = 0; m < many_sums.size(); m++) {
+			const LogicalType u = info.sums[m].v_int ? LogicalType::BIGINT : LogicalType::DOUBLE;
+			for (idx_t s = 0; s < 2; s++) {
+				for (auto &f : many_sums[m].factors[s]) {
+					if (s != side) {
+						e.push_back(null_of(u));
+					} else if (info.sums[m].ones) {
+						auto isn = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
+						isn->GetChildrenMutable().push_back(f.cast ? f.cast->Copy() : colref(f.type, f.b));
+						e.push_back(BoundCastExpression::AddCastToType(context, std::move(isn), u));
+					} else {
+						e.push_back(BoundCastExpression::AddCastToType(context, f.cast ? f.cast->Copy() : colref(f.type, f.b), u));
+					}
+				}
+			}
+		}
 		auto proj = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(e));
 		proj->children.push_back(std::move(get));
 		return std::move(proj);
@@ -1721,7 +2619,11 @@ static bool TryTesseraCross(ClientContext &context, unique_ptr<LogicalOperator> 
 		first->Cast<LogicalGet>().dynamic_filters = nullptr;
 		all = side_rows(std::move(first), 0);
 	} else {
-		const idx_t ncols = 1 + info.nk + groups.size() + (info.has_value ? 2 : 0);
+		idx_t factors = 0;
+		for (auto &ts : info.sums) {
+			factors += ts.factors[0] + ts.factors[1];
+		}
+		const idx_t ncols = 1 + info.nk + groups.size() + (info.has_value ? 2 : 0) + factors;
 		all = make_uniq<LogicalSetOperation>(binder.GenerateTableIndex(), ncols, side_rows(std::move(first), 0),
 		                                     side_rows(std::move(second), 1), LogicalOperatorType::LOGICAL_UNION, true);
 	}
@@ -1739,9 +2641,24 @@ static bool TryTesseraCross(ClientContext &context, unique_ptr<LogicalOperator> 
 			agg_owned->expressions[0] = make_uniq<BoundConstantExpression>(Value(info.agg_type));
 		}
 	}
-	const bool prune = !info.two || info.count_first;
+	const bool prune = (!info.two || info.count_first) && info.sums.empty();
 	info.min_value = prune ? push.min_value : 0;
 	info.topk = prune && info.filters.empty() ? push.topk : -1;
+	if (push.group_topk > 0 && !info.two && info.aggs.empty() && info.filters.empty()) {
+		const idx_t side = push.group_cols[0] < info.out_groups.size() ? info.out_groups[push.group_cols[0]].first : 2;
+		idx_t of_side = 0;
+		for (auto &g : info.out_groups) {
+			of_side += g.first == side ? 1 : 0;
+		}
+		bool whole = side < 2 && of_side == push.group_cols.size();
+		for (auto c : push.group_cols) {
+			whole = whole && c < info.out_groups.size() && (idx_t)info.out_groups[c].first == side;
+		}
+		if (whole) {
+			info.group_topk = push.group_topk;
+			info.group_of = info.symmetric ? TesseraGroupOf::EACH : (side == 0 ? TesseraGroupOf::FIRST : TesseraGroupOf::SECOND);
+		}
+	}
 	plan = make_uniq<LogicalTessera>(std::move(agg_owned), std::move(all), std::move(info));
 	plan->ResolveOperatorTypes();
 	return true;
@@ -1806,10 +2723,27 @@ static void Inject(ClientContext &context, unique_ptr<LogicalOperator> &plan, Bi
 		TesseraPushdown push;
 		auto slot = plan->type == LogicalOperatorType::LOGICAL_FILTER ? HavingBelow(plan->Cast<LogicalFilter>(), push)
 		                                                              : TopNBelow(plan->Cast<LogicalTopN>(), push);
+		if (!slot && plan->type == LogicalOperatorType::LOGICAL_FILTER) {
+			slot = WindowTopBelow(plan->Cast<LogicalFilter>(), push);
+		}
 		bool limited = false;
 		if (slot && (Attempt([&] { return TryTessera(context, *slot, push, &limited); }) ||
 		             (!limited && (Attempt([&] { return TryTesseraCross(context, *slot, push, binder); }) ||
-		                           Attempt([&] { return TryTesseraCross(context, *slot, push, binder, true); }))))) {
+		                           Attempt([&] { return TryTesseraCross(context, *slot, push, binder, true); }) ||
+		                           Attempt([&] { return TryTesseraCross(context, *slot, push, binder, false, true); }) ||
+		                           Attempt([&] { return TryTesseraCross(context, *slot, push, binder, true, true); }))))) {
+			return;
+		}
+	}
+	if (plan->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		TesseraPushdown push;
+		auto slot = ArgMaxTopBelow(plan->Cast<LogicalAggregate>(), push);
+		bool limited = false;
+		if (slot && (Attempt([&] { return TryTessera(context, *slot, push, &limited); }) ||
+		             (!limited && (Attempt([&] { return TryTesseraCross(context, *slot, push, binder); }) ||
+		                           Attempt([&] { return TryTesseraCross(context, *slot, push, binder, true); }) ||
+		                           Attempt([&] { return TryTesseraCross(context, *slot, push, binder, false, true); }) ||
+		                           Attempt([&] { return TryTesseraCross(context, *slot, push, binder, true, true); }))))) {
 			return;
 		}
 	}
@@ -1817,7 +2751,9 @@ static void Inject(ClientContext &context, unique_ptr<LogicalOperator> &plan, Bi
 	if (plan->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
 	    (Attempt([&] { return TryTessera(context, plan, TesseraPushdown(), &limited); }) ||
 	     (!limited && (Attempt([&] { return TryTesseraCross(context, plan, TesseraPushdown(), binder); }) ||
-	                   Attempt([&] { return TryTesseraCross(context, plan, TesseraPushdown(), binder, true); }))))) {
+	                   Attempt([&] { return TryTesseraCross(context, plan, TesseraPushdown(), binder, true); }) ||
+	                   Attempt([&] { return TryTesseraCross(context, plan, TesseraPushdown(), binder, false, true); }) ||
+	                   Attempt([&] { return TryTesseraCross(context, plan, TesseraPushdown(), binder, true, true); }))))) {
 		return;
 	}
 	for (auto &child : plan->children) {
@@ -2154,7 +3090,10 @@ static void TesseraOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOp
 	if (!TesseraOn(input.context)) {
 		return;
 	}
-	Inject(input.context, plan, input.optimizer.binder);
+	{
+		OptimizedPlanScope scope(plan);
+		Inject(input.context, plan, input.optimizer.binder);
+	}
 	RestoreDistinct(*plan);
 	column_binding_map_t<LogicalType> carried;
 	FinishEagerCounts(input.context, *plan, carried);
@@ -2182,6 +3121,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("tessera_min_expansion_cross",
 	                          "Tessera: the same limit for products of two relations (0: never)", LogicalType::DOUBLE,
 	                          Value::DOUBLE(MIN_EXPANSION_CROSS));
+	config.AddExtensionOption("tessera_min_expansion_measured",
+	                          "Tessera: the limit on the joined rows per input row that the rule counted itself, on inputs "
+	                          "without distinct counts (0: run Tessera)",
+	                          LogicalType::DOUBLE, Value::DOUBLE(MIN_EXPANSION_MEASURED));
 	TableFunction sim("tessera_sim",
 	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                   LogicalType::DOUBLE},

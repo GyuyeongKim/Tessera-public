@@ -31,6 +31,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
@@ -82,8 +83,12 @@ enum {
 	P_RELID, P_KATT, P_XATT, P_VATT, P_KTYPE, P_XTYPE, P_VTYPE, P_MODE, P_COL0_SMALLER, P_AGGTYPE, P_MINVAL,
 	P_DISTINCT, P_TOPK,
 	P_XCOLL,
-	P_CROSS, P_RELID2, P_KATT2, P_XATT2, P_VATT2, P_KTYPE2, P_XTYPE2, P_VTYPE2, P_NPARAM
+	P_CROSS, P_RELID2, P_KATT2, P_XATT2, P_VATT2, P_KTYPE2, P_XTYPE2, P_VTYPE2,
+	P_GROUP_TOPK, P_GROUP_OF, P_NPARAM
 };
+
+#define TESSERA_MAXSUMS 16
+#define TESSERA_MAXFACTORS 4
 
 typedef struct TesseraMatch {
 	int64 p[P_NPARAM];
@@ -438,8 +443,41 @@ static bool count_all(TesseraMatch *m, bool cross, Aggref *a) {
 	return att_not_null(rel, v->varattno);
 }
 
+static bool plain_condition(Node *q) {
+	if (IsA(q, BoolExpr)) {
+		ListCell *lc;
+		foreach (lc, ((BoolExpr *)q)->args) {
+			if (!plain_condition((Node *)lfirst(lc))) {
+				return false;
+			}
+		}
+		return true;
+	}
+	if (!IsA(q, OpExpr) || list_length(((OpExpr *)q)->args) != 2) {
+		return false;
+	}
+	const char *op = catalog_opname(((OpExpr *)q)->opno);
+	if (!op || (strcmp(op, "<") != 0 && strcmp(op, "<=") != 0 && strcmp(op, ">") != 0 && strcmp(op, ">=") != 0 &&
+	            strcmp(op, "=") != 0 && strcmp(op, "<>") != 0)) {
+		return false;
+	}
+	ListCell *lc;
+	foreach (lc, ((OpExpr *)q)->args) {
+		Node *e = (Node *)lfirst(lc);
+		if (!as_var(e) && !IsA(e, Aggref) && !IsA(e, Const)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static void having_prune(List *having, TesseraMatch *m) {
 	ListCell *lc;
+	foreach (lc, having) {
+		if (!plain_condition((Node *)lfirst(lc))) {
+			return;
+		}
+	}
 	foreach (lc, having) {
 		Node *q = (Node *)lfirst(lc);
 		if (!IsA(q, OpExpr) || list_length(((OpExpr *)q)->args) != 2) {
@@ -503,8 +541,77 @@ static bool lower_bound_of(Node *q, Node *agg) {
 	       (strcmp(op, flip ? "<=" : ">=") == 0 || strcmp(op, flip ? "<" : ">") == 0);
 }
 
+static bool plain_targets(Query *parse) {
+	ListCell *lc;
+	foreach (lc, parse->targetList) {
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+		if (!as_var((Node *)te->expr) && !IsA(te->expr, Aggref) && !IsA(te->expr, Const) && !IsA(te->expr, WindowFunc) &&
+		    !(te->ressortgroupref && get_sortgroupref_clause_noerr(te->ressortgroupref, parse->groupClause))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static int64 rank_limit(Query *parse, Node *agg, List **partition) {
+	if (!parse->hasWindowFuncs || !agg || list_length(parse->windowClause) != 1 || !plain_targets(parse)) {
+		return -1;
+	}
+	WindowClause *wc = linitial_node(WindowClause, parse->windowClause);
+	WindowFuncLists *wl = find_window_functions((Node *)parse->targetList, wc->winref);
+	if (wl->numWindowFuncs != 1 || wc->orderClause == NIL || wc->partitionClause == NIL) {
+		return -1;
+	}
+	WindowFunc *wf = linitial_node(WindowFunc, wl->windowFuncs[wc->winref]);
+	if ((wf->winfnoid != 3100 && wf->winfnoid != 3101) || wf->aggfilter || wf->runCondition == NIL) {
+		return -1;
+	}
+	ListCell *lc;
+	foreach (lc, (List *)parse->havingQual) {
+		if (!lower_bound_of((Node *)lfirst(lc), agg)) {
+			return -1;
+		}
+	}
+	SortGroupClause *sc = linitial_node(SortGroupClause, wc->orderClause);
+	Oid opfamily, opcintype;
+	CompareType cmp;
+	if (!equal(get_sortgroupclause_expr(sc, parse->targetList), agg) ||
+	    !get_ordering_op_properties(sc->sortop, &opfamily, &opcintype, &cmp) || cmp != COMPARE_GT) {
+		return -1;
+	}
+	int64 k = -1;
+	foreach (lc, wf->runCondition) {
+		WindowFuncRunCondition *rc = lfirst_node(WindowFuncRunCondition, lc);
+		if (!IsA(rc->arg, Const) || ((Const *)rc->arg)->constisnull ||
+		    (((Const *)rc->arg)->consttype != INT8OID && ((Const *)rc->arg)->consttype != INT4OID)) {
+			continue;
+		}
+		const int64 c = ((Const *)rc->arg)->consttype == INT8OID ? DatumGetInt64(((Const *)rc->arg)->constvalue)
+		                                                         : (int64)DatumGetInt32(((Const *)rc->arg)->constvalue);
+		List *interp = get_op_index_interpretation(rc->opno);
+		if (interp == NIL) {
+			continue;
+		}
+		CompareType t = ((OpIndexInterpretation *)linitial(interp))->cmptype;
+		if (!rc->wfunc_left) {
+			t = t == COMPARE_GE ? COMPARE_LE : t == COMPARE_GT ? COMPARE_LT : COMPARE_INVALID;
+		}
+		const int64 lim = t == COMPARE_LE ? c : t == COMPARE_LT ? c - 1 : -1;
+		if (lim >= 1 && (k < 0 || lim < k)) {
+			k = lim;
+		}
+	}
+	if (k > 0) {
+		*partition = wc->partitionClause;
+	}
+	return k;
+}
+
 static void limit_prune(Query *parse, TesseraMatch *m) {
 	ListCell *lh;
+	if (!plain_targets(parse)) {
+		return;
+	}
 	foreach (lh, (List *)parse->havingQual) {
 		if (!lower_bound_of((Node *)lfirst(lh), (Node *)m->agg)) {
 			return;
@@ -616,6 +723,20 @@ static bool match_agg(PlannerInfo *root, TesseraMatch *m, int va, int vb, Var *g
 	}
 	if (!parse->hasWindowFuncs) {
 		limit_prune(parse, m);
+	} else if (m->agg) {
+		List *part = NIL;
+		const int64 k = rank_limit(parse, (Node *)m->agg, &part);
+		if (k > 0 && list_length(part) == 1) {
+			Var *pv = as_var((Node *)get_sortgroupclause_expr(linitial_node(SortGroupClause, part), parse->targetList));
+			if (pv && (equal(pv, g0) || equal(pv, g1))) {
+				const bool first = pv->varno == va;
+				m->p[P_GROUP_TOPK] = k;
+				m->p[P_GROUP_OF] = m->p[P_CROSS] ? (first ? 3 : 4)
+				                   : m->p[P_MODE] == 0 || m->p[P_MODE] == 3 ? 0
+				                   : first == (m->p[P_COL0_SMALLER] != 0)   ? 1
+				                                                            : 2;
+			}
+		}
 	}
 	return true;
 }
@@ -744,12 +865,76 @@ typedef struct TesseraGeneral {
 	bool has_v, distinct;
 	Oid aggtype;
 	int64 minval, topk;
+	int64 group_topk;
+	int group_side;
+	int nmany;
+	int many_nf[TESSERA_MAXSUMS][2];
+	AttrNumber many_att[TESSERA_MAXSUMS][2][TESSERA_MAXFACTORS];
+	bool many_null;
+	bool many_count[TESSERA_MAXSUMS];
+	int many_bits[TESSERA_MAXSUMS];
+	bool many_avg[TESSERA_MAXSUMS];
+	bool null_ok;
+	List *many_aggs;
 	Aggref *agg;
 	bool two;
 	Aggref *agg2, *agg3;
 	Oid aggtype2, avgtype;
 	bool symmetric;
 } TesseraGeneral;
+
+static bool is_float8_mul(Node *e) {
+	return IsA(e, OpExpr) && list_length(((OpExpr *)e)->args) == 2 && catalog_opname(((OpExpr *)e)->opno) &&
+	       strcmp(catalog_opname(((OpExpr *)e)->opno), "*") == 0;
+}
+
+static int many_chain(TesseraGeneral *g, int m, Node *e, int rx, int ry) {
+	if (is_float8_mul(e)) {
+		Node *l = (Node *)linitial(((OpExpr *)e)->args), *r = (Node *)lsecond(((OpExpr *)e)->args);
+		if (is_float8_mul(r)) {
+			Node *t = l;
+			l = r;
+			r = t;
+		}
+		if (is_float8_mul(r)) {
+			return -1;
+		}
+		const int a = many_chain(g, m, l, rx, ry), b = a < 0 ? -1 : many_chain(g, m, r, rx, ry);
+		return a == b ? a : -1;
+	}
+	if (!IsA(e, Var)) {
+		return -1;
+	}
+	Var *v = (Var *)e;
+	if (v->varlevelsup != 0 || v->varattno <= 0 || v->vartype != FLOAT8OID || (v->varno != rx && v->varno != ry)) {
+		return -1;
+	}
+	const int s = v->varno == rx ? 0 : 1;
+	if (g->many_nf[m][s] == TESSERA_MAXFACTORS) {
+		return -1;
+	}
+	if (!att_not_null(g->side[s].relid, v->varattno)) {
+		if (!g->null_ok) {
+			return -1;
+		}
+		g->many_null = true;
+	}
+	g->many_att[m][s][g->many_nf[m][s]++] = v->varattno;
+	return s;
+}
+
+static bool many_factors(TesseraGeneral *g, int m, Node *e, int rx, int ry) {
+	if (many_chain(g, m, e, rx, ry) >= 0) {
+		return true;
+	}
+	g->many_nf[m][0] = g->many_nf[m][1] = 0;
+	if (!is_float8_mul(e)) {
+		return false;
+	}
+	const int a = many_chain(g, m, (Node *)linitial(((OpExpr *)e)->args), rx, ry),
+	          b = a < 0 ? -1 : many_chain(g, m, (Node *)lsecond(((OpExpr *)e)->args), rx, ry);
+	return a >= 0 && b >= 0 && a != b;
+}
 
 static bool unsafe_qual_walker(Node *n, void *ctx) {
 	if (!n) {
@@ -868,7 +1053,7 @@ static bool general_refs_walker(Node *n, GeneralRefs *h) {
 	}
 	if (IsA(n, Aggref)) {
 		if (!(h->g->agg && equal(n, h->g->agg)) && !(h->g->agg2 && equal(n, h->g->agg2)) &&
-		    !(h->g->agg3 && equal(n, h->g->agg3))) {
+		    !(h->g->agg3 && equal(n, h->g->agg3)) && !list_member(h->g->many_aggs, n)) {
 			h->ok = false;
 		}
 		return false;
@@ -1052,7 +1237,24 @@ static bool child_input_ok(PlannerInfo *root, int rti) {
 	        rte->rtekind == RTE_FUNCTION || rte->rtekind == RTE_VALUES);
 }
 
-static bool match_general(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *output_rel, TesseraGeneral *g) {
+static bool group_tuples(const TesseraSide *d) {
+	return d->ng > 1 || d->gnull[0];
+}
+
+static bool group_dict(const TesseraSide *d) {
+	return group_tuples(d) || bytes_type(d->gtype[0]);
+}
+
+static int many_pair_op(const TesseraGeneral *g) {
+	const TesseraSide *x = &g->side[0], *y = &g->side[1];
+	if (g->nfilter != 1 || x->ng != 1 || y->ng != 1 || group_dict(x) || group_dict(y)) {
+		return 0;
+	}
+	return g->fop[0] == 0 ? 1 : g->fop[0] == 1 ? 2 : g->fop[0] == 2 ? 3 : g->fop[0] == 3 ? 4 : 5;
+}
+
+static bool match_general(PlannerInfo *root, UpperRelationKind stage, RelOptInfo *output_rel, TesseraGeneral *g,
+                          bool null_ok) {
 	Query *parse = root->parse;
 	int va, vb;
 	List *quals;
@@ -1239,7 +1441,7 @@ static bool match_general(PlannerInfo *root, UpperRelationKind stage, RelOptInfo
 			}
 		}
 	}
-	Aggref *aggs[3] = {NULL, NULL, NULL};
+	Aggref *aggs[TESSERA_MAXSUMS + 1];
 	int naggs = 0;
 	OutputItems oi = {g, NIL, true};
 	foreach (lc, group_tlist(parse, output_rel)) {
@@ -1259,27 +1461,128 @@ static bool match_general(PlannerInfo *root, UpperRelationKind stage, RelOptInfo
 		if (seen) {
 			continue;
 		}
-		if (naggs == 3) {
+		if (naggs == TESSERA_MAXSUMS + 1) {
 			return false;
 		}
 		aggs[naggs++] = (Aggref *)lfirst(lc);
 	}
-	Aggref *by_kind[4] = {NULL, NULL, NULL, NULL};
+	Aggref *first_sum = NULL;
+	bool differ = false;
 	for (int i = 0; i < naggs; i++) {
-		const int k = general_aggregate(g, aggs[i], rx, ry);
-		if (!k || by_kind[k]) {
+		const char *fn = get_func_namespace(aggs[i]->aggfnoid) == PG_CATALOG_NAMESPACE ? get_func_name(aggs[i]->aggfnoid) : NULL;
+		if (fn && strcmp(fn, "sum") == 0) {
+			differ = differ || (first_sum && !equal(first_sum->args, aggs[i]->args));
+			first_sum = first_sum ? first_sum : aggs[i];
+		}
+	}
+	Aggref *by_kind[4] = {NULL, NULL, NULL, NULL};
+	g->null_ok = null_ok;
+	if (differ || null_ok) {
+		if (g->side[0].child >= 0 || g->side[1].child >= 0 || g->side[0].inh || g->side[1].inh) {
 			return false;
 		}
-		by_kind[k] = aggs[i];
+		for (int i = 0; i < naggs; i++) {
+			const char *fn = get_func_namespace(aggs[i]->aggfnoid) == PG_CATALOG_NAMESPACE ? get_func_name(aggs[i]->aggfnoid) : NULL;
+			if (aggs[i]->aggfilter || aggs[i]->aggdistinct || aggs[i]->aggorder || aggs[i]->aggkind != AGGKIND_NORMAL ||
+			    aggs[i]->agglevelsup != 0) {
+				return false;
+			}
+			if (fn && strcmp(fn, "count") == 0 && aggs[i]->aggstar) {
+				if (by_kind[1]) {
+					return false;
+				}
+				by_kind[1] = aggs[i];
+				continue;
+			}
+			if (null_ok && fn && strcmp(fn, "count") == 0 && list_length(aggs[i]->args) == 1 && g->nmany < TESSERA_MAXSUMS) {
+				Var *cv = as_var((Node *)linitial_node(TargetEntry, aggs[i]->args)->expr);
+				if (!cv || cv->varlevelsup != 0 || cv->varattno <= 0 || (cv->varno != rx && cv->varno != ry)) {
+					return false;
+				}
+				const int m = g->nmany++, cs = cv->varno == rx ? 0 : 1;
+				g->many_count[m] = true;
+				g->many_att[m][cs][g->many_nf[m][cs]++] = cv->varattno;
+				g->many_null = g->many_null || !att_not_null(g->side[cs].relid, cv->varattno);
+				g->many_aggs = lappend(g->many_aggs, aggs[i]);
+				continue;
+			}
+			const bool avg = null_ok && fn && strcmp(fn, "avg") == 0 && aggs[i]->aggtype == NUMERICOID;
+			if (null_ok && fn && (strcmp(fn, "sum") == 0 || avg) && list_length(aggs[i]->args) == 1 &&
+			    g->nmany + (avg ? 1 : 0) < TESSERA_MAXSUMS && (g->nfilter == 0 || many_pair_op(g) != 0) &&
+			    (aggs[i]->aggtype == INT8OID || aggs[i]->aggtype == NUMERICOID)) {
+				Node *ae = (Node *)linitial_node(TargetEntry, aggs[i]->args)->expr;
+				Var *iv[2] = {NULL, NULL};
+				int bits = 1;
+				bool prod = false;
+				if (as_var(ae)) {
+					iv[0] = as_var(ae);
+				} else if (is_float8_mul(ae) && int_type(exprType(ae))) {
+					prod = true;
+					iv[0] = as_var((Node *)linitial(((OpExpr *)ae)->args));
+					iv[1] = as_var((Node *)lsecond(((OpExpr *)ae)->args));
+					bits = exprType(ae) == INT2OID ? 16 : exprType(ae) == INT4OID ? 32 : 64;
+				}
+				bool ok = iv[0] && (!prod || (iv[1] && (iv[0]->varno == rx) != (iv[1]->varno == rx)));
+				for (int f = 0; f < 2 && ok; f++) {
+					ok = !iv[f] || (iv[f]->varlevelsup == 0 && iv[f]->varattno > 0 && (iv[f]->varno == rx || iv[f]->varno == ry) &&
+					               int_type(iv[f]->vartype));
+				}
+				if (!ok || (!avg && (aggs[i]->aggtype == INT8OID) != (iv[1] ? exprType(ae) != INT8OID : iv[0]->vartype != INT8OID))) {
+					return false;
+				}
+				const int m = g->nmany++;
+				g->many_bits[m] = bits;
+				for (int f = 0; f < 2 && iv[f]; f++) {
+					const int vs = iv[f]->varno == rx ? 0 : 1;
+					g->many_att[m][vs][g->many_nf[m][vs]++] = iv[f]->varattno;
+					g->many_null = g->many_null || !att_not_null(g->side[vs].relid, iv[f]->varattno);
+				}
+				g->many_aggs = lappend(g->many_aggs, aggs[i]);
+				if (avg) {
+					const int c = g->nmany++;
+					g->many_avg[m] = true;
+					g->many_count[c] = true;
+					for (int s2 = 0; s2 < 2; s2++) {
+						g->many_nf[c][s2] = g->many_nf[m][s2];
+						for (int f = 0; f < g->many_nf[m][s2]; f++) {
+							g->many_att[c][s2][f] = g->many_att[m][s2][f];
+						}
+					}
+					g->many_aggs = lappend(g->many_aggs, makeConst(INT8OID, -1, InvalidOid, 8, Int64GetDatum(0), false, true));
+				}
+				continue;
+			}
+			if (!fn || strcmp(fn, "sum") != 0 || list_length(aggs[i]->args) != 1 || aggs[i]->aggtype != FLOAT8OID ||
+			    g->nmany == TESSERA_MAXSUMS) {
+				return false;
+			}
+			const int m = g->nmany++;
+			if (!many_factors(g, m, (Node *)linitial_node(TargetEntry, aggs[i]->args)->expr, rx, ry)) {
+				return false;
+			}
+			g->many_aggs = lappend(g->many_aggs, aggs[i]);
+		}
+		if (null_ok && !g->many_null) {
+			return false;
+		}
+		g->agg = by_kind[1];
+	} else {
+		for (int i = 0; i < naggs; i++) {
+			const int k = general_aggregate(g, aggs[i], rx, ry);
+			if (!k || by_kind[k]) {
+				return false;
+			}
+			by_kind[k] = aggs[i];
+		}
+		if (naggs == 0 || (by_kind[2] && by_kind[3] && !equal(by_kind[2]->args, by_kind[3]->args)) ||
+		    (by_kind[3] && g->distinct)) {
+			return false;
+		}
+		g->two = naggs >= 2 || by_kind[3];
+		g->agg = g->two ? by_kind[1] : aggs[0];
+		g->agg2 = g->two ? by_kind[2] : NULL;
+		g->agg3 = by_kind[3];
 	}
-	if (naggs == 0 || (by_kind[2] && by_kind[3] && !equal(by_kind[2]->args, by_kind[3]->args)) ||
-	    (by_kind[3] && g->distinct)) {
-		return false;
-	}
-	g->two = naggs >= 2 || by_kind[3];
-	g->agg = g->two ? by_kind[1] : aggs[0];
-	g->agg2 = g->two ? by_kind[2] : NULL;
-	g->agg3 = by_kind[3];
 	g->aggtype = g->agg ? g->agg->aggtype : INT8OID;
 	g->aggtype2 = g->agg2 ? g->agg2->aggtype : g->two ? NUMERICOID : InvalidOid;
 	g->avgtype = g->agg3 ? g->agg3->aggtype : InvalidOid;
@@ -1304,8 +1607,30 @@ static bool match_general(PlannerInfo *root, UpperRelationKind stage, RelOptInfo
 		limit_prune(parse, &tm);
 		g->topk = tm.p[P_TOPK];
 	}
+	if (g->nfilter == 0 && parse->hasWindowFuncs && g->agg && !g->two && !g->agg2 && !g->agg3 && g->nmany == 0) {
+		List *part = NIL;
+		const int64 k = rank_limit(parse, (Node *)g->agg, &part);
+		if (k > 0) {
+			int side = -1, n = 0;
+			ListCell *lp;
+			foreach (lp, part) {
+				Node *e = (Node *)get_sortgroupclause_expr(lfirst_node(SortGroupClause, lp), parse->targetList);
+				const int s0 = general_group_node(&g->side[0], e) >= 0 ? 0 : general_group_node(&g->side[1], e) >= 0 ? 1 : -1;
+				if (s0 < 0 || (side >= 0 && s0 != side)) {
+					side = -2;
+					break;
+				}
+				side = s0;
+				n++;
+			}
+			if (side >= 0 && n == g->side[side].ng) {
+				g->group_topk = k;
+				g->group_side = side;
+			}
+		}
+	}
 	const TesseraSide *x = &g->side[0], *y = &g->side[1];
-	bool sym = x->child < 0 && y->child < 0 && x->relid == y->relid && x->inh == y->inh && x->nk == y->nk &&
+	bool sym = g->nmany == 0 && x->child < 0 && y->child < 0 && x->relid == y->relid && x->inh == y->inh && x->nk == y->nk &&
 	           x->ng == y->ng && x->vatt == y->vatt &&
 	           x->vcast == y->vcast &&
 	           (x->vatt != 0) == g->has_v && memcmp(x->katt, y->katt, sizeof(AttrNumber) * x->nk) == 0 &&
@@ -1353,7 +1678,20 @@ static bool general_expands(PlannerInfo *root, const TesseraGeneral *g) {
 static List *general_to_list(const TesseraGeneral *g) {
 	List *scal = NIL, *filt = NIL;
 	int64 v[] = {g->nfilter, g->has_v,    g->distinct, g->aggtype,   g->minval,
-	             g->topk,    g->two,      g->aggtype2, g->symmetric, g->avgtype};
+	             g->topk,    g->two,      g->aggtype2, g->symmetric, g->avgtype,
+	             g->group_topk, g->group_side};
+	List *many = list_make2_int(g->nmany, g->many_null);
+	for (int m = 0; m < g->nmany; m++) {
+		many = lappend_int(many, g->many_count[m]);
+		many = lappend_int(many, g->many_bits[m]);
+		many = lappend_int(many, g->many_avg[m]);
+		for (int s = 0; s < 2; s++) {
+			many = lappend_int(many, g->many_nf[m][s]);
+			for (int f = 0; f < g->many_nf[m][s]; f++) {
+				many = lappend_int(many, g->many_att[m][s][f]);
+			}
+		}
+	}
 	for (int i = 0; i < (int)lengthof(v); i++) {
 		scal = lappend(scal, makeConst(INT8OID, -1, InvalidOid, 8, Int64GetDatum(v[i]), false, true));
 	}
@@ -1392,16 +1730,18 @@ static List *general_to_list(const TesseraGeneral *g) {
 		out = lappend(out, list_make5(misc, katt, ktype, gatt,
 		                              lappend(lappend(lappend(list_make4(gtype, d->quals, gnull, gexpr), kpos), gpos), kexpr)));
 	}
+	out = lappend(lappend(out, many), g->many_aggs);
 	return out;
 }
 
 static void general_from_list(List *l, TesseraGeneral *g) {
 	memset(g, 0, sizeof *g);
 	List *scal = linitial(l), *filt = lsecond(l);
-	int64 v[10];
+	int64 v[12];
 	int i = 0;
 	ListCell *lc;
 	foreach (lc, scal) {
+		Assert(i < (int)lengthof(v));
 		v[i++] = DatumGetInt64(lfirst_node(Const, lc)->constvalue);
 	}
 	g->nfilter = (int)v[0];
@@ -1414,6 +1754,26 @@ static void general_from_list(List *l, TesseraGeneral *g) {
 	g->aggtype2 = (Oid)v[7];
 	g->symmetric = v[8] != 0;
 	g->avgtype = (Oid)v[9];
+	g->group_topk = v[10];
+	g->group_side = (int)v[11];
+	{
+		List *many = list_nth(l, list_length(l) - 2);
+		int pos = 0;
+		g->nmany = list_nth_int(many, pos++);
+		g->many_null = list_nth_int(many, pos++) != 0;
+		for (int m = 0; m < g->nmany; m++) {
+			g->many_count[m] = list_nth_int(many, pos++) != 0;
+			g->many_bits[m] = list_nth_int(many, pos++);
+			g->many_avg[m] = list_nth_int(many, pos++) != 0;
+			for (int s = 0; s < 2; s++) {
+				g->many_nf[m][s] = list_nth_int(many, pos++);
+				for (int f = 0; f < g->many_nf[m][s]; f++) {
+					g->many_att[m][s][f] = (AttrNumber)list_nth_int(many, pos++);
+				}
+			}
+		}
+		g->many_aggs = llast(l);
+	}
 	for (int f = 0; f < g->nfilter; f++) {
 		g->fx[f] = list_nth_int(filt, 4 * f);
 		g->fy[f] = list_nth_int(filt, 4 * f + 1);
@@ -1468,7 +1828,7 @@ static void tessera_upper_hook(PlannerInfo *root, UpperRelationKind stage, RelOp
 			return;
 		}
 		priv = list_make2(params_list(m.p), makeInteger(m.va));
-	} else if (match_general(root, stage, output_rel, &g)) {
+	} else if (match_general(root, stage, output_rel, &g, false) || match_general(root, stage, output_rel, &g, true)) {
 		if (!general_expands(root, &g)) {
 			return;
 		}
@@ -1554,6 +1914,12 @@ static Plan *tessera_plan_path(PlannerInfo *root, RelOptInfo *rel, struct Custom
 		int kind;
 		if (IsA(te->expr, Aggref)) {
 			kind = !general || !g.two ? 2 : agg_is(te->expr, "sum") ? 3 : agg_is(te->expr, "avg") ? 4 : 2;
+			if (general && g.nmany > 0 && (agg_is(te->expr, "sum") || !((Aggref *)te->expr)->aggstar)) {
+				kind = -1;
+				for (int m = 0; m < g.nmany; m++) {
+					kind = equal(te->expr, list_nth(g.many_aggs, m)) ? 300 + m : kind;
+				}
+			}
 		} else if (general) {
 			const int i = general_group_node(&g.side[0], (Node *)te->expr), j = general_group_node(&g.side[1], (Node *)te->expr);
 			kind = i >= 0 ? 100 + i : j >= 0 ? 200 + j : -1;
@@ -1609,6 +1975,7 @@ typedef struct TesseraState {
 	bool ran;
 	bool wide;
 	bool nonfinite;
+	bool many_nonfinite[TESSERA_MAXSUMS];
 	HTAB *nan_keys[2], *nan_cells, *collect;
 	int64 *coll_k, *coll_x;
 	bool *coll_nan;
@@ -1617,6 +1984,9 @@ typedef struct TesseraState {
 	int64 *rb_x0, *rb_x1, *rb_vi, *rb_cnt, *rb_hi;
 	uint64 *rb_lo;
 	double *rb_vd;
+	double *rb_many;
+	uint64_t *rb_nulls;
+	int64_t *rb_isums;
 	int rb_n, rb_pos, rb_cap, rb_dict[2];
 	bool rb_ready, rb_general;
 	MemoryContextCallback release;
@@ -1917,14 +2287,6 @@ static bool general_dict(int n, const Oid *type) {
 	return n > 1 || bytes_type(type[0]);
 }
 
-static bool group_tuples(const TesseraSide *d) {
-	return d->ng > 1 || d->gnull[0];
-}
-
-static bool group_dict(const TesseraSide *d) {
-	return group_tuples(d) || bytes_type(d->gtype[0]);
-}
-
 static int64 group_code(TupleTableSlot *slot, const TesseraSide *d, ExprState **gstate, ExprContext *ec,
                         tessera_dict_c *dg, StringInfo buf, bool *null) {
 	*null = false;
@@ -2048,6 +2410,9 @@ typedef struct SideRows {
 	ExprState *gstate[TESSERA_MAXCOLS], *kstate[TESSERA_MAXCOLS];
 	int64 *kb, *xb, *vib;
 	double *vb;
+	double *mb;
+	int64 *mib;
+	uint64 *nb;
 	bool dec;
 	Datum pow;
 	int n;
@@ -2079,6 +2444,13 @@ static void side_rows_init(TesseraState *s, SideRows *r, const TesseraSide *d, i
 	r->xb = palloc(sizeof(int64) * SCAN_BATCH);
 	r->vb = g->has_v && !int_v ? palloc(sizeof(double) * SCAN_BATCH) : NULL;
 	r->vib = g->has_v && int_v ? palloc(sizeof(int64) * SCAN_BATCH) : NULL;
+	r->mb = g->nmany ? palloc(sizeof(double) * SCAN_BATCH * g->nmany) : NULL;
+	r->nb = g->many_null ? palloc(sizeof(uint64) * SCAN_BATCH) : NULL;
+	bool many_int = false;
+	for (int m = 0; m < g->nmany; m++) {
+		many_int = many_int || g->many_bits[m] > 0;
+	}
+	r->mib = many_int ? palloc0(sizeof(int64) * SCAN_BATCH * g->nmany) : NULL;
 	r->dec = d->vatt && d->vtype == NUMERICOID && !d->vcast;
 	int64 pow10 = 1;
 	for (int i = 0; i < weight_scale(d); i++) {
@@ -2091,7 +2463,9 @@ static void side_rows_add(TesseraState *s, SideRows *r, bool int_v) {
 	if (r->n == 0) {
 		return;
 	}
-	const int rc = int_v ? (r->side ? tessera_c_add_y_i64(s->q, r->kb, r->xb, (const int64_t *)r->vib, r->n)
+	const int rc = s->g.nmany ? tessera_c_add_many2(s->q, r->side, r->kb, r->xb, r->mb, (const int64_t *)r->mib,
+	                                                (const uint64_t *)r->nb, r->n)
+	               : int_v ? (r->side ? tessera_c_add_y_i64(s->q, r->kb, r->xb, (const int64_t *)r->vib, r->n)
 	                                : tessera_c_add_i64(s->q, r->kb, r->xb, (const int64_t *)r->vib, r->n))
 	                     : (r->side ? tessera_c_add_y(s->q, r->kb, r->xb, r->vb, r->n) : tessera_c_add(s->q, r->kb, r->xb, r->vb, r->n));
 	if (rc != 0) {
@@ -2115,6 +2489,68 @@ static void side_rows_tuple(TesseraState *s, SideRows *r, TupleTableSlot *slot, 
 	}
 	r->xb[n] = group_code(slot, d, r->gstate, ec, r->dg, buf, &xn);
 	ResetExprContext(ec);
+	if (g->many_null) {
+		r->nb[n] = 0;
+	}
+	for (int m = 0; m < g->nmany; m++) {
+		if (g->many_bits[m] > 0) {
+			int64 iv = 1;
+			if (g->many_nf[m][r->side] == 1) {
+				bool null;
+				const AttrNumber at = g->many_att[m][r->side][0];
+				const Datum dv = slot_getattr(slot, at, &null);
+				const Oid t = TupleDescAttr(slot->tts_tupleDescriptor, at - 1)->atttypid;
+				if (null) {
+					if (!g->many_null) {
+						elog(ERROR, "tessera: NULL group keys or values");
+					}
+					r->nb[n] |= (uint64)1 << m;
+					iv = 0;
+				} else {
+					iv = t == INT2OID ? DatumGetInt16(dv) : t == INT4OID ? DatumGetInt32(dv) : DatumGetInt64(dv);
+				}
+			}
+			r->mib[(size_t)n * g->nmany + m] = iv;
+			r->mb[(size_t)n * g->nmany + m] = 0;
+			continue;
+		}
+		double p = 1.0;
+		uint64 mark = 0;
+		bool is_null = false;
+		for (int f = 0; f < g->many_nf[m][r->side]; f++) {
+			bool null;
+			const Datum dv = slot_getattr(slot, g->many_att[m][r->side][f], &null);
+			if (null) {
+				if (!g->many_null) {
+					elog(ERROR, "tessera: NULL group keys or values");
+				}
+				is_null = true;
+				break;
+			}
+			if (g->many_count[m]) {
+				continue;
+			}
+			const double fv = DatumGetFloat8(dv), q = p * fv;
+			s->many_nonfinite[m] = s->many_nonfinite[m] || !isfinite(fv);
+			if (!mark && isinf(q) && !isinf(p) && !isinf(fv)) {
+				mark = TESSERA_C_ROW_VALUE_OVERFLOW;
+			} else if (!mark && q == 0 && p != 0 && fv != 0) {
+				mark = TESSERA_C_ROW_VALUE_UNDERFLOW;
+			}
+			p = q;
+		}
+		if (isnan(p)) {
+			p = (double)NAN;
+		}
+		if (is_null) {
+			r->nb[n] |= (uint64)1 << m;
+			p = g->many_count[m] ? 1.0 : 0.0;
+		}
+		if (mark) {
+			memcpy(&p, &mark, sizeof p);
+		}
+		r->mb[(size_t)n * g->nmany + m] = p;
+	}
 	Datum vd = d->vatt ? slot_getattr(slot, d->vatt, &vn) : 0;
 	const bool nan = r->dec && !vn && numeric_is_nan(DatumGetNumeric(vd));
 	if (s->collect) {
@@ -2215,6 +2651,15 @@ static void scan_rows(TesseraState *s, const TesseraSide *const *ds, const int *
 		}
 		if (rs[i].vib) {
 			pfree(rs[i].vib);
+		}
+		if (rs[i].mb) {
+			pfree(rs[i].mb);
+		}
+		if (rs[i].nb) {
+			pfree(rs[i].nb);
+		}
+		if (rs[i].mib) {
+			pfree(rs[i].mib);
 		}
 	}
 	FreeExprContext(ec, true);
@@ -2329,10 +2774,28 @@ static bool same_rows(const TesseraSide *x, const TesseraSide *y) {
 	return equal(qy, x->quals);
 }
 
+static void raise_float_errors(const TesseraState *s) {
+	const int e = tessera_c_float_errors(s->q);
+	if (e & 1) {
+		ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE), errmsg("value out of range: overflow")));
+	}
+	if (e & 2) {
+		ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE), errmsg("value out of range: underflow")));
+	}
+}
+
 static void tessera_run_general(TesseraState *s) {
 	const TesseraGeneral *g = &s->g;
 	const TesseraSide *x = &g->side[0], *y = &g->side[1];
 	s->q = g->symmetric ? tessera_c_new(g->has_v) : tessera_c_new_cross(g->has_v);
+	if (s->q && g->nmany > 0) {
+		tessera_c_set_many(s->q, (size_t)g->nmany, many_pair_op(g));
+		for (int m = 0; m < g->nmany; m++) {
+			if (g->many_bits[m] > 0) {
+				tessera_c_set_many_int(s->q, (size_t)m, 1);
+			}
+		}
+	}
 	if (!s->q || (general_dict(x->nk, x->ktype) && !(s->dk = tessera_dict_new())) ||
 	    (group_dict(x) && !(s->dx = tessera_dict_new())) || (!g->symmetric && group_dict(y) && !(s->dy = tessera_dict_new()))) {
 		elog(ERROR, "tessera: out of memory");
@@ -2370,16 +2833,42 @@ static void tessera_run_general(TesseraState *s) {
 	tessera_c_set_two(s->q, g->two);
 	const bool dec = (x->vatt && x->vtype == NUMERICOID) || (y->vatt && y->vtype == NUMERICOID);
 	const int pb = dec ? 0 : Max(x->vatt ? int_bits(x->vtype) : 16, y->vatt ? int_bits(y->vtype) : 16);
-	if (int_v && pb && g->nfilter > 0) {
-		tessera_c_set_pair_filter(s->q, pair_pass, s, pb);
+	const bool float_v = !int_v && (g->has_v || g->nmany > 0);
+	if (((int_v && pb) || float_v) && g->nfilter > 0) {
+		tessera_c_set_pair_filter(s->q, pair_pass, s, float_v ? 64 : pb);
 	}
+	if (float_v) {
+		tessera_c_set_float_errors(s->q, 1);
+		tessera_c_set_float_accum(s->q, g->avgtype == FLOAT8OID);
+	}
+	const bool no_prune = s->nan_keys[0] || s->nan_keys[1];
 	char err[256];
 	instr_time t0;
 	INSTR_TIME_SET_CURRENT(t0);
-	int rc = tessera_c_run(s->q, 0, 1, (uint64_t)Max(g->minval, 0), g->topk > 0 ? g->topk : -1,
+	if (g->group_topk > 0 && !no_prune) {
+		tessera_c_set_group_top(s->q, g->group_topk, g->symmetric ? 0 : g->group_side == 0 ? 3 : 4);
+	}
+	int rc = tessera_c_run(s->q, 0, 1, no_prune ? 0 : (uint64_t)Max(g->minval, 0), !no_prune && g->topk > 0 ? g->topk : -1,
 	                       query_threads(tessera_threads), tessera_frontier, tessera_verbose, err, sizeof err);
 	if (rc != TESSERA_C_OK) {
 		run_error(rc, err);
+	}
+	if (float_v) {
+		raise_float_errors(s);
+	}
+	for (int m = 0; m < g->nmany; m++) {
+		if (g->many_bits[m] > 0) {
+			const int bits = g->many_bits[m] >= 16 ? g->many_bits[m] : 0;
+			const int ov = tessera_c_many_overflow(s->q, (size_t)m, bits,
+			                                       !g->many_avg[m] && ((Aggref *)list_nth(g->many_aggs, m))->aggtype == INT8OID ? 64 : 0);
+			if (ov & 1) {
+				ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				                errmsg(bits == 16 ? "smallint out of range" : bits == 32 ? "integer out of range" : "bigint out of range")));
+			}
+			if (ov & 2) {
+				ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE), errmsg("bigint out of range")));
+			}
+		}
 	}
 	if (tessera_verbose) {
 		instr_time t1;
@@ -2412,8 +2901,8 @@ typedef struct GroupVal {
 	bool null;
 } GroupVal;
 
-static void float_result(const TesseraState *s, double v) {
-	if (!s->nonfinite && !isfinite(v)) {
+static void float_result(bool nonfinite, double v) {
+	if (!nonfinite && !isfinite(v)) {
 		ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE), errmsg("value out of range: overflow")));
 	}
 }
@@ -2506,6 +2995,9 @@ static int read_ahead(TesseraState *s) {
 			s->rb_hi = palloc(sizeof(int64) * s->rb_cap);
 			s->rb_lo = palloc(sizeof(uint64) * s->rb_cap);
 			s->rb_vd = palloc(sizeof(double) * s->rb_cap);
+			s->rb_many = s->general && s->g.nmany ? palloc(sizeof(double) * s->rb_cap * s->g.nmany) : NULL;
+			s->rb_nulls = s->general && s->g.many_null ? palloc(sizeof(uint64_t) * s->rb_cap) : NULL;
+			s->rb_isums = s->general && s->g.nmany ? palloc(sizeof(int64_t) * 2 * s->rb_cap * s->g.nmany) : NULL;
 			MemoryContextSwitchTo(old);
 		}
 		s->rb_general = tessera_c_general(s->q) != 0;
@@ -2520,7 +3012,9 @@ static int read_ahead(TesseraState *s) {
 		s->rb_ready = true;
 	}
 	size_t n;
-	if (s->general && s->g.two) {
+	if (s->general && s->g.nmany > 0) {
+		n = tessera_c_next_many2(s->q, s->rb_x0, s->rb_x1, s->rb_cnt, s->rb_many, s->rb_isums, s->rb_nulls, (size_t)s->rb_cap);
+	} else if (s->general && s->g.two) {
 		n = tessera_c_next_batch2(s->q, s->rb_x0, s->rb_x1, s->rb_cnt, s->rb_hi, s->rb_lo, s->rb_vd, (size_t)s->rb_cap);
 	} else if (s->wide) {
 		n = tessera_c_next_batch128(s->q, s->rb_x0, s->rb_x1, s->rb_hi, s->rb_lo, (size_t)s->rb_cap);
@@ -2555,6 +3049,9 @@ static TupleTableSlot *tessera_next_general(TesseraState *s, TupleTableSlot *slo
 	int64_t x0, x1, vi = 0, hi = 0, cnt = 0;
 	uint64_t lo = 0;
 	double vd = 0;
+	const double *many_row = NULL;
+	const int64_t *many_irow = NULL;
+	uint64_t many_nulls = 0;
 	int general = 0;
 	uint64 c0 = tessera_verbose ? __rdtsc() : 0;
 	for (;;) {
@@ -2565,7 +3062,12 @@ static TupleTableSlot *tessera_next_general(TesseraState *s, TupleTableSlot *slo
 		x0 = s->rb_x0[r];
 		x1 = s->rb_x1[r];
 		vd = s->rb_vd[r];
-		if (g->two) {
+		if (g->nmany > 0) {
+			cnt = s->rb_cnt[r];
+			many_row = s->rb_many + (size_t)r * g->nmany;
+			many_nulls = s->rb_nulls ? s->rb_nulls[r] : 0;
+			many_irow = s->rb_isums + (size_t)r * g->nmany * 2;
+		} else if (g->two) {
 			cnt = s->rb_cnt[r];
 			hi = s->rb_hi[r];
 			lo = s->rb_lo[r];
@@ -2616,7 +3118,30 @@ static TupleTableSlot *tessera_next_general(TesseraState *s, TupleTableSlot *slo
 	for (int c = 0; c < s->ncol; c++) {
 		const int k = s->kind[c];
 		Datum d;
-		if (nan && ((k == 4 && g->avgtype == NUMERICOID) || (k == 3 && g->aggtype2 == NUMERICOID) ||
+		if (k >= 300 && g->many_count[k - 300]) {
+			d = Int64GetDatum(many_nulls >> (k - 300) & 1 ? 0 : (int64)many_row[k - 300]);
+		} else if (k >= 300 && many_nulls >> (k - 300) & 1) {
+			slot->tts_values[c] = (Datum)0;
+			slot->tts_isnull[c] = true;
+			continue;
+		} else if (k >= 300 && g->many_avg[k - 300]) {
+			const int m = k - 300;
+			MemoryContext old = MemoryContextSwitchTo(s->css.ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
+			d = DirectFunctionCall2(numeric_div, numeric_of_i128(many_irow[2 * m + 1], (uint64_t)many_irow[2 * m]),
+			                        NumericGetDatum(int64_to_numeric((int64)many_row[m + 1])));
+			MemoryContextSwitchTo(old);
+		} else if (k >= 300 && g->many_bits[k - 300] > 0) {
+			const int64_t lo = many_irow[2 * (k - 300)], hi = many_irow[2 * (k - 300) + 1];
+			MemoryContext old = MemoryContextSwitchTo(s->css.ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
+			d = ((Aggref *)list_nth(g->many_aggs, k - 300))->aggtype == INT8OID ? Int64GetDatum(lo)
+			                                                                   : numeric_of_i128(hi, (uint64_t)lo);
+			MemoryContextSwitchTo(old);
+		} else if (k >= 300) {
+			float_result(s->many_nonfinite[k - 300], many_row[k - 300]);
+			d = Float8GetDatum(many_row[k - 300]);
+		} else if (k == 2 && g->nmany > 0) {
+			d = Int64GetDatum(cnt);
+		} else if (nan && ((k == 4 && g->avgtype == NUMERICOID) || (k == 3 && g->aggtype2 == NUMERICOID) ||
 		            (k == 2 && !g->two && g->aggtype == NUMERICOID))) {
 			d = nan_d;
 		} else if (k == 2 && g->two) {
@@ -2624,7 +3149,7 @@ static TupleTableSlot *tessera_next_general(TesseraState *s, TupleTableSlot *slo
 		} else if (k == 4) {
 			MemoryContext old = MemoryContextSwitchTo(s->css.ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
 			if (g->avgtype != NUMERICOID) {
-				float_result(s, vd);
+				float_result(s->nonfinite, vd);
 			}
 			d = g->avgtype == NUMERICOID ? DirectFunctionCall2(numeric_div, numeric_of_i128_scaled(hi, lo, vs),
 			                                                   NumericGetDatum(int64_to_numeric(cnt)))
@@ -2637,7 +3162,7 @@ static TupleTableSlot *tessera_next_general(TesseraState *s, TupleTableSlot *slo
 				MemoryContextSwitchTo(old);
 			} else {
 				if (g->aggtype2 == FLOAT8OID) {
-					float_result(s, vd);
+					float_result(s->nonfinite, vd);
 				}
 				d = g->aggtype2 == FLOAT8OID ? Float8GetDatum(vd) : Int64GetDatum((int64)lo);
 			}
@@ -2648,7 +3173,7 @@ static TupleTableSlot *tessera_next_general(TesseraState *s, TupleTableSlot *slo
 				MemoryContextSwitchTo(old);
 			} else {
 				if (g->aggtype == FLOAT8OID) {
-					float_result(s, general || s->wide ? vd : (double)vi);
+					float_result(s->nonfinite, general || s->wide ? vd : (double)vi);
 				}
 				d = g->aggtype == FLOAT8OID ? Float8GetDatum(general || s->wide ? vd : (double)vi) : Int64GetDatum(vi);
 			}
@@ -2747,11 +3272,20 @@ static void tessera_run(TesseraState *s) {
 	tessera_c_set_stop(s->q, pg_should_stop, NULL);
 	tessera_c_set_distinct_keys(s->q, s->p[P_DISTINCT] != 0);
 	char err[256];
+	if (s->p[P_GROUP_TOPK] > 0) {
+		tessera_c_set_group_top(s->q, s->p[P_GROUP_TOPK], (int)s->p[P_GROUP_OF]);
+	}
+	if (has_v && !int_v) {
+		tessera_c_set_float_errors(s->q, 1);
+	}
 	int rc = tessera_c_run(s->q, (int)s->p[P_MODE], (int)s->p[P_COL0_SMALLER], (uint64_t)s->p[P_MINVAL],
 	                       s->p[P_TOPK] > 0 ? s->p[P_TOPK] : -1,
 	                       query_threads(tessera_threads), tessera_frontier, tessera_verbose, err, sizeof err);
 	if (rc != TESSERA_C_OK) {
 		run_error(rc, err);
+	}
+	if (has_v && !int_v) {
+		raise_float_errors(s);
 	}
 	if (int_v) {
 		const int pb = Max(int_bits((Oid)s->p[P_VTYPE]), int_bits(cross ? (Oid)s->p[P_VTYPE2] : (Oid)s->p[P_VTYPE]));
@@ -2819,7 +3353,7 @@ static TupleTableSlot *tessera_next(ScanState *ss) {
 			MemoryContextSwitchTo(old);
 		} else if (s->kind[c] == 2) {
 			if (at == FLOAT8OID) {
-				float_result(s, general || s->wide ? vd : (double)vi);
+				float_result(s->nonfinite, general || s->wide ? vd : (double)vi);
 			}
 			d = at == FLOAT8OID ? Float8GetDatum(general || s->wide ? vd : (double)vi) : Int64GetDatum(vi);
 		} else {
@@ -2929,6 +3463,9 @@ static void tessera_explain(CustomScanState *node, List *ancestors, ExplainState
 		if (g->topk > 0) {
 			ExplainPropertyInteger("Tessera top-k prune", NULL, g->topk, es);
 		}
+		if (g->group_topk > 0) {
+			ExplainPropertyInteger("Tessera rank prune", NULL, g->group_topk, es);
+		}
 		ExplainPropertyText("Tessera core", psprintf("%s (%s)", tessera_c_version(), tessera_c_isa()), es);
 		return;
 	}
@@ -2940,6 +3477,9 @@ static void tessera_explain(CustomScanState *node, List *ancestors, ExplainState
 	}
 	if (s->p[P_TOPK] > 0) {
 		ExplainPropertyInteger("Tessera top-k prune", NULL, s->p[P_TOPK], es);
+	}
+	if (s->p[P_GROUP_TOPK] > 0) {
+		ExplainPropertyInteger("Tessera rank prune", NULL, s->p[P_GROUP_TOPK], es);
 	}
 	ExplainPropertyText("Tessera core", psprintf("%s (%s)", tessera_c_version(), tessera_c_isa()), es);
 }
