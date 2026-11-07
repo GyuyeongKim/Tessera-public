@@ -224,19 +224,23 @@ These run as the engine's own plan, with the same result:
 - in DuckDB, sums that each read one side and no product across the two (`SUM(a.v), SUM(b.v)`), which DuckDB computes
   below the join;
 - nondeterministic collations, whose equality is not equality of bytes;
-- in PostgreSQL and Spark, `SUM` of `real` / `float` products, which those engines sum in float32.
+- in PostgreSQL and Spark, `SUM` of `real` / `float` products, which those engines sum in float32;
+- in PostgreSQL, several different sums (a cosine) and sums over columns that may hold NULLs when an input is a
+  partitioned or inherited table or has its own plan, or when the query holds an aggregate other than `COUNT(*)` beside
+  them (`COUNT(col)` and `AVG` of integers run there when a column may hold NULLs).
 
 NULLs: group columns may hold NULLs, and so may summed and counted columns. As in SQL, a joined pair adds to a sum only
 when all its factors are non-NULL, a cell without such a pair has a NULL sum, `COUNT(col)` counts the pairs where `col`
 is not NULL, and `AVG` divides by that count. DuckDB does this for floating-point and integer weights, PostgreSQL for
-`float8` and integer weights, and Spark for `DOUBLE` weights and, in ANSI mode, `INT` and `BIGINT` weights. Such an
-integer sum under a pair filter needs a single comparison of two integer group columns, and in PostgreSQL and Spark it
-is a sum of one column or of a product of one column from each input. Where a column may hold NULLs, these stay with the
-engine: decimal weights, `AVG` of `float8` in PostgreSQL and of integers in Spark, integer weights without ANSI mode in
-Spark, and in PostgreSQL partitioned and inherited tables and inputs with their own plans. The SQLite table functions
+`float8` and integer weights, and Spark for `DOUBLE` weights and, in ANSI mode, `INT` and `BIGINT` weights. An integer
+sum over columns that may hold NULLs is a sum of one column or of a product of one column from each input. Under a pair
+filter, it needs a single comparison of two integer group columns, each the only group column of its input and known to
+hold no NULLs (from DuckDB's statistics, a `NOT NULL` constraint, or a non-nullable Spark column). Where a column may
+hold NULLs, these stay with the engine: decimal weights, `AVG` of `float8` and a product of an integer and a `float8`
+column in PostgreSQL, and in Spark `AVG` of integers and integer weights without ANSI mode. The SQLite table functions
 take NULL group keys in mode `'full'` and in `tessera_xty`, leave their rows out with a pair filter, and return an error
-on a NULL value. A DuckDB statement prepared while its summed columns held no NULLs returns an error that asks to
-prepare it again if NULLs arrive later.
+on a NULL value. A DuckDB statement prepared while its group and summed columns held no NULLs returns an error that
+asks to prepare it again if NULLs arrive later.
 
 Operators: PostgreSQL's adapter recognizes only PostgreSQL's own operators and aggregates, so a user's `*` earlier on
 the search path keeps the engine's plan. A group or key computed from a column must be an expression that cannot raise
@@ -293,12 +297,12 @@ on macOS in a process without such a library.
 Tessera uses DuckDB's `threads`, and output beyond `memory_limit` goes to `temp_directory` within
 `max_temp_directory_size`.
 
-A pandas DataFrame or a Parquet or CSV file has no distinct counts, so the planner reads about 262,144 rows of each input
-and counts the joined rows itself. It reads a little of every row group of a local Parquet file and of every part of a
-DataFrame, so a file sorted by another column is measured like any other. It reads from the start where it cannot skip
-ahead: CSV files, remote files, a Parquet file with three quarters of its rows in one row group, inputs with a pushed
-filter, and several files without `parquet_metadata_cache`; a join that looks small there stays with DuckDB, with the
-same result. Arrow readers are read once only, so Arrow tables and Polars frames stay with DuckDB unless
+A pandas DataFrame or a Parquet or CSV file has no distinct counts, so the planner reads about 262,144 rows of each
+input and counts the joined rows itself. It reads a little of every row group of a local Parquet file and of every part
+of a DataFrame, so a file sorted by another column is measured like any other. It reads from the start where it cannot
+skip ahead: CSV files, remote files, a Parquet file with three quarters of its rows in one row group, inputs with a
+pushed filter, and several files without `parquet_metadata_cache`; a join that looks small there stays with DuckDB, with
+the same result. Arrow readers are read once only, so Arrow tables and Polars frames stay with DuckDB unless
 `tessera_min_expansion_cross` is set to `0`.
 
 ```sql
@@ -441,10 +445,10 @@ prints phase times to stderr. The threshold and the top-k limit only prune, so k
 | `tessera_c_set_distinct_keys` | `COUNT(DISTINCT a.k)`: each shared key counts once per pair |
 | `tessera_c_set_two`, `tessera_c_next_batch2` | A count and a sum of the same pairs in one run |
 | `tessera_c_set_pair_filter` | Overflow checks that count only the pairs passing the caller's filters |
-| `tessera_c_set_many`, `tessera_c_add_many`, `tessera_c_next_many` | `COUNT(*)` and several sums of a product of two relations in one pass, one value per sum and row, with an optional pair filter |
+| `tessera_c_set_many`, `tessera_c_add_many`, `tessera_c_next_many` | `COUNT(*)` and several sums of a product of two relations (a handle from `tessera_c_new_cross(0)`) in one pass, one value per sum and row, with an optional pair filter (`0` none, `1` `<`, `2` `<=`, `3` `>`, `4` `>=`, `5` `<>`, codes unlike those of `tessera_c_run`) |
 | `tessera_c_set_many_int`, `tessera_c_add_many2`, `tessera_c_next_many2`, `tessera_c_many_overflow` | Exact integer sums among them, each sum's overflow, and NULL factors: a pair adds to a sum only when neither row marks it NULL, and a sum without such a pair comes back NULL |
-| `tessera_c_set_group_top` | The top values of each group: only the cells that can reach rank `k` of their group come back |
-| `tessera_c_set_float_errors`, `tessera_c_set_float_accum`, `tessera_c_float_errors` | Whether a product of two doubles overflowed or underflowed to zero, for an engine that raises an error then |
+| `tessera_c_set_group_top` | The top values of each group: only the cells that can reach rank `k` of their group come back. The group is column 0 when both orders of a pair are rows (`0`), the column holding the lower or higher key (`1`, `2`), or the cross product's x or y (`3`, `4`) |
+| `tessera_c_set_float_errors`, `tessera_c_set_float_accum`, `tessera_c_float_errors` | Whether a product of two doubles overflowed or underflowed to zero, for an engine that raises an error then. `tessera_c_set_float_accum` adds the overflow of an `AVG`'s running sum (PostgreSQL's `float8_accum`), and a row value `TESSERA_C_ROW_VALUE_OVERFLOW` or `TESSERA_C_ROW_VALUE_UNDERFLOW` marks a row whose own factors did so |
 | `tessera_c_set_sum_limit` | The magnitude above which an integer sum is an error or NULL in the engine: no pruning unless every sum stays below it |
 | `tessera_c_general` | Whether the values come back as doubles (`vd`) rather than integers (`vi`) |
 
