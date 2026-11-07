@@ -78,6 +78,11 @@ public final class TesseraNative {
   public static native void cancel(long h);
   public static native void setSimilarity(long h, int measure, double minSim);
   public static native void setDistinctKeys(long h, boolean on);
+  public static native void setGroupTop(long h, long k, int of);
+  public static native void setSumLimit(long h, double limit);
+  public static native void setMany(long h, int nSums, int pairOp);
+  public static native int addMany(long h, boolean second, long[] k, long[] x, double[] values, int n);
+  public static native int nextMany(long h, long[] x0, long[] x1, long[] cnt, double[] sums);
 
   public static native int next(long h, long[] x0, long[] x1, long[] vi, double[] vd);
   public static native int next2(long h, long[] x0, long[] x1, long[] cnt, long[] vi, double[] vd);

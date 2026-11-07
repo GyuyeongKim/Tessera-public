@@ -996,52 +996,119 @@ Checksum xtx(const Csr& X, const Options& opt, Stats* st) {
   if (HS < M && (opt.sparse || opt.hl)) {
     double tc = now_s();
     cptr.assign(M + 1, 0);
-    std::vector<std::vector<int64_t>> cnt(T);
+    if (T > 1 && (int64_t)T * (M - HS) > X.ptr[X.n_rows]) {
+      constexpr int BLOCK_BITS = 15;
+      const int64_t blocks = ((int64_t)(M - HS - 1) >> BLOCK_BITS) + 1;
+      std::vector<std::vector<int64_t>> bcnt(T);
 #pragma omp parallel num_threads(T)
-    {
-      auto& c = cnt[omp_get_thread_num()];
-      const bool ok = scratch(space, [&] { c.assign(M - HS, 0); });
+      {
+        auto& c = bcnt[omp_get_thread_num()];
+        const bool ok = scratch(space, [&] { c.assign(blocks, 0); });
 #pragma omp for schedule(static)
-      for (int32_t r = 0; r < X.n_rows; r++) {
-        if (!ok) continue;
-        for (int64_t e = X.ptr[r + 1] - 1; e >= X.ptr[r] && X.idx[e] >= HS; e--) c[X.idx[e] - HS]++;
+        for (int32_t r = 0; r < X.n_rows; r++) {
+          if (!ok) continue;
+          for (int64_t e = X.ptr[r + 1] - 1; e >= X.ptr[r] && X.idx[e] >= HS; e--) c[(X.idx[e] - HS) >> BLOCK_BITS]++;
+        }
       }
-    }
-    if (space.oom.load()) return out_of_memory();
-    for (int32_t j = HS; j < M; j++) {
-      int64_t run = cptr[j];
-      for (int t = 0; t < T; t++) { int64_t n = cnt[t][j - HS]; cnt[t][j - HS] = run; run += n; }
-      cptr[j + 1] = run;
-    }
-    crow.resize(cptr[M]);
-    if (has_val) cval.resize(cptr[M]);
-    if (wide) cival.resize(cptr[M]);
-    if (general) cwval.resize(cptr[M]);
-    if (!X.xval.empty()) cxval.resize(cptr[M]);
-    if (!X.xval_wide.empty()) cxval_wide.resize(cptr[M]);
+      if (space.oom.load()) return out_of_memory();
+      std::vector<int64_t> bptr(blocks + 1, 0);
+      for (int64_t b = 0; b < blocks; b++) {
+        int64_t run = bptr[b];
+        for (int t = 0; t < T; t++) { int64_t n = bcnt[t][b]; bcnt[t][b] = run; run += n; }
+        bptr[b + 1] = run;
+      }
+      const int64_t entries = bptr[blocks];
+      struct Entry { int32_t item, row; int64_t e; };
+      std::unique_ptr<Entry[]> parted(new Entry[entries]);
 #pragma omp parallel num_threads(T)
-    {
-      auto& c = cnt[omp_get_thread_num()];
-      if (!exact) {
+      {
+        auto& c = bcnt[omp_get_thread_num()];
 #pragma omp for schedule(static)
         for (int32_t r = 0; r < X.n_rows; r++)
-          for (int64_t e = X.ptr[r + 1] - 1; e >= X.ptr[r] && X.idx[e] >= HS; e--) {
-            int64_t o = c[X.idx[e] - HS]++;
-            crow[o] = r;
-            if (has_val) cval[o] = X.val[e];
-            if (wide) cival[o] = X.ival[e];
-            if (general) cwval[o] = X.wval[e];
+          for (int64_t e = X.ptr[r + 1] - 1; e >= X.ptr[r] && X.idx[e] >= HS; e--)
+            parted[c[(X.idx[e] - HS) >> BLOCK_BITS]++] = {X.idx[e], r, e};
+      }
+      crow.resize(entries);
+      if (has_val) cval.resize(entries);
+      if (wide) cival.resize(entries);
+      if (general) cwval.resize(entries);
+      if (!X.xval.empty()) cxval.resize(entries);
+      if (!X.xval_wide.empty()) cxval_wide.resize(entries);
+#pragma omp parallel num_threads(T)
+      {
+        std::vector<int64_t> at;
+        const bool ok = scratch(space, [&] { at.resize((size_t)1 << BLOCK_BITS); });
+#pragma omp for schedule(dynamic, 1)
+        for (int64_t b = 0; b < blocks; b++) {
+          if (!ok) continue;
+          const int64_t base = (b << BLOCK_BITS) + HS;
+          const int64_t width = std::min<int64_t>((int64_t)1 << BLOCK_BITS, M - base);
+          std::fill(at.begin(), at.begin() + width, 0);
+          for (int64_t o = bptr[b]; o < bptr[b + 1]; o++) at[parted[o].item - base]++;
+          int64_t run = bptr[b];
+          for (int64_t w = 0; w < width; w++) { cptr[base + w] = run; int64_t n = at[w]; at[w] = run; run += n; }
+          for (int64_t o = bptr[b]; o < bptr[b + 1]; o++) {
+            const Entry& p = parted[o];
+            const int64_t q = at[p.item - base]++;
+            crow[q] = p.row;
+            if (has_val) cval[q] = X.val[p.e];
+            if (wide) cival[q] = X.ival[p.e];
+            if (general) cwval[q] = X.wval[p.e];
+            if (!X.xval.empty()) cxval[q] = X.xval[p.e];
+            if (!X.xval_wide.empty()) cxval_wide[q] = X.xval_wide[p.e];
           }
-      } else {
-        const bool narrow = !X.xval.empty();
+        }
+      }
+      if (space.oom.load()) return out_of_memory();
+      cptr[M] = entries;
+    } else {
+      std::vector<std::vector<int64_t>> cnt(T);
+#pragma omp parallel num_threads(T)
+      {
+        auto& c = cnt[omp_get_thread_num()];
+        const bool ok = scratch(space, [&] { c.assign(M - HS, 0); });
 #pragma omp for schedule(static)
-        for (int32_t r = 0; r < X.n_rows; r++)
-          for (int64_t e = X.ptr[r + 1] - 1; e >= X.ptr[r] && X.idx[e] >= HS; e--) {
-            int64_t o = c[X.idx[e] - HS]++;
-            crow[o] = r;
-            if (narrow) cxval[o] = X.xval[e];
-            else cxval_wide[o] = X.xval_wide[e];
-          }
+        for (int32_t r = 0; r < X.n_rows; r++) {
+          if (!ok) continue;
+          for (int64_t e = X.ptr[r + 1] - 1; e >= X.ptr[r] && X.idx[e] >= HS; e--) c[X.idx[e] - HS]++;
+        }
+      }
+      if (space.oom.load()) return out_of_memory();
+      for (int32_t j = HS; j < M; j++) {
+        int64_t run = cptr[j];
+        for (int t = 0; t < T; t++) { int64_t n = cnt[t][j - HS]; cnt[t][j - HS] = run; run += n; }
+        cptr[j + 1] = run;
+      }
+      crow.resize(cptr[M]);
+      if (has_val) cval.resize(cptr[M]);
+      if (wide) cival.resize(cptr[M]);
+      if (general) cwval.resize(cptr[M]);
+      if (!X.xval.empty()) cxval.resize(cptr[M]);
+      if (!X.xval_wide.empty()) cxval_wide.resize(cptr[M]);
+#pragma omp parallel num_threads(T)
+      {
+        auto& c = cnt[omp_get_thread_num()];
+        if (!exact) {
+#pragma omp for schedule(static)
+          for (int32_t r = 0; r < X.n_rows; r++)
+            for (int64_t e = X.ptr[r + 1] - 1; e >= X.ptr[r] && X.idx[e] >= HS; e--) {
+              int64_t o = c[X.idx[e] - HS]++;
+              crow[o] = r;
+              if (has_val) cval[o] = X.val[e];
+              if (wide) cival[o] = X.ival[e];
+              if (general) cwval[o] = X.wval[e];
+            }
+        } else {
+          const bool narrow = !X.xval.empty();
+#pragma omp for schedule(static)
+          for (int32_t r = 0; r < X.n_rows; r++)
+            for (int64_t e = X.ptr[r + 1] - 1; e >= X.ptr[r] && X.idx[e] >= HS; e--) {
+              int64_t o = c[X.idx[e] - HS]++;
+              crow[o] = r;
+              if (narrow) cxval[o] = X.xval[e];
+              else cxval_wide[o] = X.xval_wide[e];
+            }
+        }
       }
     }
     S_.t_colidx = now_s() - tc;

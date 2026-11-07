@@ -8,11 +8,19 @@
 
 namespace duckdb {
 
+enum class TesseraGroupOf : uint8_t { EACH, LOWER, HIGHER, FIRST, SECOND };
+
 enum class TesseraPairMode : uint8_t {
 	FULL,
 	LT,
 	LE,
 	NE
+};
+
+struct TesseraSum {
+	bool v_int = false;
+	LogicalType sum_type, prod_type;
+	idx_t factors[2] = {0, 0};
 };
 
 struct TesseraPlanInfo {
@@ -49,6 +57,7 @@ struct TesseraPlanInfo {
 	bool two = false, count_first = true;
 	LogicalType agg2_type;
 	vector<uint8_t> aggs;
+	vector<TesseraSum> sums;
 	LogicalType avg_input;
 	bool symmetric = false;
 	bool KDict() const {
@@ -65,6 +74,8 @@ struct TesseraPlanInfo {
 	}
 	uint64_t min_value = 0;
 	int64_t topk = -1;
+	int64_t group_topk = -1;
+	TesseraGroupOf group_of = TesseraGroupOf::EACH;
 	int sim_measure = 0;
 	double min_sim = 0;
 	LogicalType x_type, v_type, agg_type;
@@ -72,12 +83,30 @@ struct TesseraPlanInfo {
 	LogicalType prod_type;
 };
 
+inline InsertionOrderPreservingMap<string> TesseraPruneParams(const TesseraPlanInfo &info) {
+	InsertionOrderPreservingMap<string> r;
+	if (info.min_value > 0) {
+		r["Prune"] = ">= " + to_string(info.min_value);
+	}
+	if (info.topk > 0) {
+		r["Prune"] = "top " + to_string(info.topk);
+	}
+	if (info.group_topk > 0) {
+		r["Prune"] = "rank <= " + to_string(info.group_topk);
+	}
+	return r;
+}
+
 class LogicalTessera : public LogicalExtensionOperator {
 public:
 	LogicalTessera(unique_ptr<LogicalAggregate> agg_op, unique_ptr<LogicalOperator> child, TesseraPlanInfo info);
 
 	unique_ptr<LogicalAggregate> agg_op;
 	TesseraPlanInfo info;
+
+	InsertionOrderPreservingMap<string> ParamsToString() const override {
+		return TesseraPruneParams(info);
+	}
 
 	string GetName() const override {
 		return "TESSERA";
@@ -98,6 +127,10 @@ public:
 	                TesseraPlanInfo info, idx_t estimated_cardinality);
 
 	TesseraPlanInfo info;
+
+	InsertionOrderPreservingMap<string> ParamsToString() const override {
+		return TesseraPruneParams(info);
+	}
 
 	string GetName() const override {
 		return "TESSERA";

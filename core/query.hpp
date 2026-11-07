@@ -20,7 +20,11 @@ struct QueryPart {
   std::vector<int64_t> k, x;
   std::vector<double> v;
   std::vector<int64_t> iv;
+  std::vector<std::vector<double>> sum_v;
+  std::vector<std::vector<int64_t>> sum_iv;
 };
+
+enum class GroupOf : uint8_t { EACH, LOWER, HIGHER, FIRST, SECOND };
 
 enum class Similarity : uint8_t { NONE, COSINE, JACCARD, DICE, OVERLAP };
 
@@ -29,6 +33,9 @@ struct QuerySpec {
   PairMode mode = PairMode::FULL;
   uint64_t min_value = 0;
   int64_t topk = -1;
+  int64_t group_topk = -1;
+  GroupOf group_of = GroupOf::EACH;
+  int many_pair_op = 0;
   int threads = 1;
   int64_t frontier = -1;
   bool reorder = true;
@@ -49,7 +56,12 @@ struct QuerySpec {
   bool (*pair_pass)(void* ctx, int64_t a, int64_t b) = nullptr;
   void* pair_ctx = nullptr;
   __int128 prod_lo = 0, prod_hi = 0;
+  bool float_errors = false;
+  bool float_accum = false;
+  double sum_limit = 0;
 };
+
+constexpr uint64_t ROW_VALUE_OVERFLOW = 0x7ff8000000000001ull, ROW_VALUE_UNDERFLOW = 0x7ff8000000000002ull;
 
 struct Cancelled : std::runtime_error {
   Cancelled() : std::runtime_error("tessera: query cancelled") {}
@@ -65,6 +77,14 @@ struct QueryResult {
   std::vector<uint8_t> side;
   std::vector<std::vector<__int128>> out2;
   bool general2 = false;
+  struct SumResult {
+    size_t at = 1;
+    bool general = false, int_values = false;
+    __int128 prod_min = 0, prod_max = 0, cell_min = 0, cell_max = 0;
+  };
+  size_t stride = 1;
+  std::vector<SumResult> sums;
+  int float_errors = 0;
 };
 
 void run_query(std::vector<std::unique_ptr<QueryPart>>& parts, const QuerySpec& q, QueryResult& r);
@@ -74,6 +94,9 @@ void run_query_cross(std::vector<std::unique_ptr<QueryPart>>& parts_x, std::vect
 
 void run_query_two(std::vector<std::unique_ptr<QueryPart>>& parts, std::vector<std::unique_ptr<QueryPart>>* parts_y,
                    const QuerySpec& spec, QueryResult& r);
+
+void run_query_many(std::vector<std::unique_ptr<QueryPart>>& parts, std::vector<std::unique_ptr<QueryPart>>& parts_y,
+                    size_t n_sums, const QuerySpec& spec, QueryResult& r);
 
 double cell_value(uint64_t s, bool general);
 inline __int128 cell_value128(const Cells& c, size_t q, bool wide) {

@@ -433,3 +433,321 @@ query II
 EXPLAIN SELECT a.xu, b.xi, COUNT(*) FROM fw a JOIN fw b ON a.k = b.k AND a.xu < b.xi GROUP BY a.xu, b.xi;
 ----
 physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE rk AS SELECT (hash(i) % 700)::BIGINT AS k, floor(power(hash(i + 1) / 18446744073709551616.0, 2) * 500)::BIGINT AS x,
+  'v' || (hash(i + 2) % 90) AS s, (hash(i + 3) % 4)::BIGINT AS c, (hash(i + 4) % 31)::BIGINT - 15 AS v,
+  CASE WHEN i % 2003 = 0 THEN 'NaN'::DOUBLE ELSE (hash(i + 5) % 1000) / 100.0 END AS d,
+  CASE WHEN i % 11 = 0 THEN NULL ELSE (hash(i + 6) % 60)::BIGINT END AS xn,
+  ((hash(i + 7) % 9)::BIGINT + 1) * 1000000000000000 AS h FROM range(30000) t(i);
+
+statement ok
+CREATE TABLE rs AS SELECT (hash(i + 8) % 700)::BIGINT AS k, (hash(i + 9) % 120)::BIGINT AS y, (hash(i + 10) % 9)::BIGINT AS w FROM range(9000) t(i);
+
+statement ok
+CREATE MACRO rank27() AS TABLE
+  SELECT 'rn_a' AS q, i, j, c::DOUBLE AS c FROM (SELECT a.x i, b.x j, COUNT(*) c, ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC, b.x) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 7
+  UNION ALL SELECT 'rn_b', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, ROW_NUMBER() OVER (PARTITION BY b.x ORDER BY COUNT(*) DESC, a.x) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 7
+  UNION ALL SELECT 'rank', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'lt_op', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r < 4
+  UNION ALL SELECT 'eq_one', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r = 1
+  UNION ALL SELECT 'flip', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE 3 >= r
+  UNION ALL SELECT 'between', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC, b.x) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r BETWEEN 3 AND 5
+  UNION ALL SELECT 'lt_a', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'lt_b', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY b.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'gt_a', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k AND a.x > b.x GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'gt_b', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY b.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k AND a.x > b.x GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'le_a', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k AND a.x <= b.x GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'ge_b', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY b.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k AND a.x >= b.x GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'ne_a', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k AND a.x <> b.x GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'sum_neg', i, j, c FROM (SELECT a.x i, b.x j, SUM(a.v * b.v) c, RANK() OVER (PARTITION BY a.x ORDER BY SUM(a.v * b.v) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'sum_nan', i, j, round(c, 6) FROM (SELECT a.x i, b.x j, SUM(a.d * b.d) c, RANK() OVER (PARTITION BY a.x ORDER BY SUM(a.d * b.d) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'distinct', i, j, c FROM (SELECT a.x i, b.x j, COUNT(DISTINCT a.k) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(DISTINCT a.k) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'wide', i, j, c FROM (SELECT a.x i, b.x j, SUM(a.h::HUGEINT * b.h) c, RANK() OVER (PARTITION BY a.x ORDER BY SUM(a.h::HUGEINT * b.h) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'cross_x', i, j, c FROM (SELECT a.x i, b.y j, COUNT(*) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rs b ON a.k = b.k GROUP BY a.x, b.y) WHERE r <= 3
+  UNION ALL SELECT 'cross_y', i, j, c FROM (SELECT a.x i, b.y j, COUNT(*) c, RANK() OVER (PARTITION BY b.y ORDER BY COUNT(*) DESC) r FROM rk a JOIN rs b ON a.k = b.k GROUP BY a.x, b.y) WHERE r <= 3
+  UNION ALL SELECT 'cross_sum', i, j, c FROM (SELECT a.x i, b.y j, SUM(a.v * b.w) c, RANK() OVER (PARTITION BY b.y ORDER BY SUM(a.v * b.w) DESC) r FROM rk a JOIN rs b ON a.k = b.k GROUP BY a.x, b.y) WHERE r <= 3
+  UNION ALL SELECT 'tuple', i, j, c FROM (SELECT a.x + 1000 * a.c i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.c, a.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.c, a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'null_group', coalesce(i, -1), j, c FROM (SELECT a.xn i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.xn ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.xn, b.x) WHERE r <= 3
+  UNION ALL SELECT 'string', hash(i) % 1000000, hash(j) % 1000000, c FROM (SELECT a.s i, b.s j, COUNT(*) c, RANK() OVER (PARTITION BY a.s ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.s, b.s) WHERE r <= 3
+  UNION ALL SELECT 'str_lt', hash(i) % 1000000, hash(j) % 1000000, c FROM (SELECT a.s i, b.s j, COUNT(*) c, RANK() OVER (PARTITION BY b.s ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k AND a.s < b.s GROUP BY a.s, b.s) WHERE r <= 3
+  UNION ALL SELECT 'qualify', a.x, NULL, COUNT(*) FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x QUALIFY ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) <= 7
+  UNION ALL SELECT 'qualify_b', b.x, NULL, COUNT(*) FROM rk a JOIN rk b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x QUALIFY ROW_NUMBER() OVER (PARTITION BY b.x ORDER BY COUNT(*) DESC) <= 7
+  UNION ALL SELECT 'qualify_1', a.x, NULL, COUNT(*) FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x QUALIFY ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) = 1
+  UNION ALL SELECT 'arg_max', i, NULL, c FROM (SELECT i, max(c) c FROM (SELECT a.x i, b.x j, COUNT(*) c FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) GROUP BY i)
+  UNION ALL SELECT 'arg_null', coalesce(i, -1), NULL, arg_max(CASE WHEN j IS NULL THEN NULL ELSE c END, c) FROM (SELECT a.x i, b.xn j, COUNT(*) c FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.xn) GROUP BY i
+  UNION ALL SELECT 'dense', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, DENSE_RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'asc', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*)) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'both', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.x, b.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 1
+  UNION ALL SELECT 'computed', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.x % 10 ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'part', i, j, c FROM (SELECT a.x + 1000 * a.c i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.c ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.c, a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'other_order', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY b.x DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'two_windows', i, j, c + t FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) r, SUM(COUNT(*)) OVER (PARTITION BY a.x) t FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 3
+  UNION ALL SELECT 'nested', i, j, c + t FROM (SELECT i, j, c, t, RANK() OVER (PARTITION BY i ORDER BY c DESC) r FROM (SELECT a.x i, b.x j, COUNT(*) c, SUM(COUNT(*)) OVER (PARTITION BY a.x) t FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x)) WHERE r <= 3
+  UNION ALL SELECT 'row_filter', i, j, c FROM (SELECT a.x i, b.y j, COUNT(*) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rs b ON a.k = b.k AND a.x < b.y GROUP BY a.x, b.y) WHERE r <= 3
+  UNION ALL SELECT 'or_filter', i, j, c FROM (SELECT a.x i, b.x j, COUNT(*) c, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) r FROM rk a JOIN rk b ON a.k = b.k GROUP BY a.x, b.x) WHERE r <= 3 OR j = 5;
+
+statement ok
+CREATE TABLE with_rank27 AS SELECT * FROM rank27();
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE without_rank27 AS SELECT * FROM rank27();
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM with_rank27 EXCEPT ALL SELECT * FROM without_rank27) UNION ALL (SELECT * FROM without_rank27 EXCEPT ALL SELECT * FROM with_rank27));
+----
+0
+
+query I
+SELECT count(DISTINCT q) FROM with_rank27 WHERE c IS NOT NULL;
+----
+40
+
+statement ok
+CREATE TABLE ms AS SELECT (hash(i) % 900)::BIGINT AS k, floor(power(hash(i + 1) / 18446744073709551616.0, 2) * 400)::BIGINT AS x,
+  1 + (hash(i + 2) % 5)::DOUBLE AS r, (hash(i + 3) % 21)::BIGINT - 10 AS v, 1 + (hash(i + 4) % 9)::INTEGER AS n, 'g' || (hash(i + 5) % 40) AS s FROM range(40000) t(i);
+
+statement ok
+CREATE TABLE mt AS SELECT (hash(i + 6) % 900)::BIGINT AS k, (hash(i + 7) % 150)::BIGINT AS y, 1 + (hash(i + 8) % 3)::DOUBLE AS r, (hash(i + 9) % 7)::BIGINT AS w FROM range(12000) t(i);
+
+statement ok
+CREATE MACRO many27() AS TABLE
+  SELECT 'cosine' AS q, a.x AS i, b.x AS j, round(SUM(a.r * b.r) / (SQRT(SUM(a.r * a.r)) * SQRT(SUM(b.r * b.r))), 6)::DOUBLE AS v0, NULL::DOUBLE AS v1, NULL::DOUBLE AS v2 FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'three', a.x, b.x, round(SUM(a.r * b.r), 6), round(SUM(a.r * a.r), 6), round(SUM(b.r * b.r), 6) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'count_first', a.x, b.x, COUNT(*), round(SUM(a.r * b.r), 6), round(SUM(a.r), 6) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'count_last', a.x, b.x, round(SUM(a.r), 6), round(SUM(b.r), 6), COUNT(*) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'pearson', a.x, b.x, round((COUNT(*) * SUM(a.r * b.r) - SUM(a.r) * SUM(b.r)) / NULLIF(SQRT((COUNT(*) * SUM(a.r * a.r) - SUM(a.r) * SUM(a.r)) * (COUNT(*) * SUM(b.r * b.r) - SUM(b.r) * SUM(b.r))), 0), 5), NULL, NULL FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'ints', a.x, b.x, SUM(a.v * b.v), SUM(a.v), SUM(b.n) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'int_int32', a.x, b.x, SUM(a.n * b.n), SUM(a.n), COUNT(*) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'mixed', a.x, b.x, round(SUM(a.r * b.r), 6), SUM(a.v * b.v), COUNT(*) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'lt', a.x, b.x, round(SUM(a.r * b.r), 6), round(SUM(a.r * a.r), 6), COUNT(*) FROM ms a JOIN ms b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'ne', a.x, b.x, round(SUM(a.r * b.r), 6), round(SUM(b.r * b.r), 6), COUNT(*) FROM ms a JOIN ms b ON a.k = b.k AND a.x <> b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'having', a.x, b.x, COUNT(*), round(SUM(a.r * b.r), 6), round(SUM(a.r * a.r), 6) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x HAVING COUNT(*) >= 50
+  UNION ALL SELECT 'having_sum', a.x, b.x, round(SUM(a.r * b.r), 6), round(SUM(a.r * a.r), 6), COUNT(*) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x HAVING SUM(a.r * b.r) >= 200
+  UNION ALL SELECT 'where', a.x, b.x, round(SUM(a.r * b.r), 6), round(SUM(a.r * a.r), 6), COUNT(*) FROM ms a JOIN ms b ON a.k = b.k WHERE a.n > 3 AND b.r < 5 GROUP BY a.x, b.x
+  UNION ALL SELECT 'two_rel', a.x, b.y, round(SUM(a.r * b.r), 6), round(SUM(a.r * a.r), 6), SUM(a.v * b.w) FROM ms a JOIN mt b ON a.k = b.k GROUP BY a.x, b.y
+  UNION ALL SELECT 'cast', a.x, b.y, round(SUM(a.v * b.r), 6), round(SUM(a.n * b.r), 6), COUNT(*) FROM ms a JOIN mt b ON a.k = b.k GROUP BY a.x, b.y
+  UNION ALL SELECT 'triple', a.x, b.x, round(SUM(a.r * a.r * b.r), 6), round(SUM(a.r * b.r * b.r), 6), round(SUM(a.r * b.r), 6) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'strings', hash(a.s) % 1000000, hash(b.s) % 1000000, round(SUM(a.r * b.r), 6), round(SUM(a.r), 6), COUNT(*) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.s, b.s
+  UNION ALL SELECT 'tuple', a.x, b.x + 1000 * a.n, round(SUM(a.r * b.r), 6), round(SUM(a.r), 6), COUNT(*) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.n, a.x, b.x
+  UNION ALL SELECT 'not_taken', a.x, b.x, round(SUM(a.r - b.r), 6), round(SUM(a.r * b.r), 6), COUNT(*) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'no_sum', a.x, b.x, COUNT(*), MIN(a.v), round(SUM(a.r), 6) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x;
+
+statement ok
+CREATE TABLE with_many27 AS SELECT * FROM many27();
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE without_many27 AS SELECT * FROM many27();
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM with_many27 EXCEPT ALL SELECT * FROM without_many27) UNION ALL (SELECT * FROM without_many27 EXCEPT ALL SELECT * FROM with_many27));
+----
+0
+
+query I
+SELECT count(DISTINCT q) FROM with_many27;
+----
+20
+
+query II
+EXPLAIN SELECT a.x, b.x, SUM(a.r * b.r) / (SQRT(SUM(a.r * a.r)) * SQRT(SUM(b.r * b.r))) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query II
+EXPLAIN SELECT a.x, b.y, SUM(a.r * b.r), SUM(a.v * b.w), COUNT(*) FROM ms a JOIN mt b ON a.k = b.k GROUP BY a.x, b.y;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query II
+EXPLAIN SELECT a.x, b.x, COUNT(*), SUM(a.r), SUM(b.r), SUM(a.r * b.r), SUM(a.r * a.r), SUM(b.r * b.r) FROM ms a JOIN ms b ON a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+statement ok
+CREATE TABLE mo AS SELECT i % 4 AS k, i % 3 AS x, 4000000000000000000 AS big, 1.5::DOUBLE AS r, 3000000000 AS m FROM range(4000) t(i);
+
+statement error
+SELECT a.x, b.x, SUM(a.big * b.big), SUM(a.r * b.r) FROM mo a JOIN mo b ON a.k = b.k GROUP BY a.x, b.x;
+----
+Overflow
+
+query I
+SELECT count(*) FROM (SELECT a.x, b.x, SUM(a.big), SUM(a.r * b.r) FROM mo a JOIN mo b ON a.k = b.k GROUP BY a.x, b.x);
+----
+9
+
+query I
+SELECT count(*) FROM (SELECT a.x, b.x, SUM(a.m * b.m), SUM(a.r * b.r) FROM mo a JOIN mo b ON a.k = b.k GROUP BY a.x, b.x);
+----
+9
+
+statement ok
+CREATE TABLE mp AS SELECT i % 2 AS k, i % 2 + (i % 4) * 10 AS x, CASE WHEN i % 4 = 3 THEN 4000000000000000000 ELSE 1 END AS big, 1.5::DOUBLE AS r FROM range(400) t(i);
+
+query I
+SELECT count(*) > 0 FROM (SELECT a.x, b.x, SUM(a.r * b.r), SUM(a.big * b.big) FROM mp a JOIN mp b ON a.k = b.k AND a.x < b.x AND a.x < 30 AND b.x < 30 GROUP BY a.x, b.x);
+----
+true
+
+statement ok
+CREATE MACRO many27f() AS TABLE
+  SELECT 'lt' AS q, a.x AS i, b.x AS j, round(SUM(a.r * b.r), 6)::DOUBLE AS c, round(SUM(a.r * a.r), 6) AS d FROM ms a JOIN ms b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'le', a.x, b.x, round(SUM(a.r * b.r), 6), round(SUM(b.r * b.r), 6) FROM ms a JOIN ms b ON a.k = b.k AND a.x <= b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'gt', a.x, b.x, round(SUM(a.r * b.r), 6), round(SUM(a.r), 6) FROM ms a JOIN ms b ON a.k = b.k AND a.x > b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'ge', a.x, b.x, round(SUM(a.r * b.r), 6), round(SUM(b.r), 6) FROM ms a JOIN ms b ON a.k = b.k AND a.x >= b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'ne', a.x, b.x, round(SUM(a.r * b.r), 6), round(SUM(a.r * a.r), 6) FROM ms a JOIN ms b ON a.k = b.k AND a.x <> b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'str', hash(a.s) % 100000, hash(b.s) % 100000, round(SUM(a.r * b.r), 6), round(SUM(a.r), 6) FROM ms a JOIN ms b ON a.k = b.k AND a.s < b.s GROUP BY a.s, b.s
+  UNION ALL SELECT 'cross_lt', a.x, b.y, round(SUM(a.r * b.r), 6), round(SUM(a.r * a.r), 6) FROM ms a JOIN mt b ON a.k = b.k AND a.x < b.y GROUP BY a.x, b.y;
+
+statement ok
+CREATE TABLE with_manyf AS SELECT * FROM many27f();
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE without_manyf AS SELECT * FROM many27f();
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM with_manyf EXCEPT ALL SELECT * FROM without_manyf) UNION ALL (SELECT * FROM without_manyf EXCEPT ALL SELECT * FROM with_manyf));
+----
+0
+
+statement ok
+CREATE TABLE rv27 (k BIGINT NOT NULL, x BIGINT NOT NULL, y BIGINT NOT NULL);
+
+statement ok
+INSERT INTO rv27 SELECT i % 40, i % 30, i * 7 % 1000 FROM range(1200) t(i);
+
+statement ok
+CREATE MACRO rv27q() AS TABLE
+  SELECT 'args_row' AS q, x, y, n FROM (SELECT a.x AS x, b.x AS y, ROW_NUMBER(ORDER BY b.x) OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) AS n FROM rv27 a JOIN rv27 b ON a.k = b.k GROUP BY a.x, b.x) WHERE n <= 1
+  UNION ALL SELECT 'args_rank', x, y, n FROM (SELECT a.x AS x, b.x AS y, RANK(ORDER BY b.x DESC) OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) AS n FROM rv27 a JOIN rv27 b ON a.k = b.k GROUP BY a.x, b.x) WHERE n <= 2;
+
+statement ok
+CREATE TABLE with_rv AS SELECT * FROM rv27q();
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE without_rv AS SELECT * FROM rv27q();
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM with_rv EXCEPT ALL SELECT * FROM without_rv) UNION ALL (SELECT * FROM without_rv EXCEPT ALL SELECT * FROM with_rv));
+----
+0
+
+statement ok
+CREATE TABLE fv27 (k BIGINT NOT NULL, x BIGINT NOT NULL, v DOUBLE NOT NULL, u DOUBLE NOT NULL);
+
+statement ok
+INSERT INTO fv27 VALUES (6, 20, 1e308, 1), (6, 21, -1e308, 1), (7, 20, 1e154, 1), (7, 21, 1e308, 1), (1, 1, 'Infinity', 1), (1, 2, 3, 1), (1, 2, -7, 1), (2, 1, 1e300, 1e300), (2, 2, 1e300, 0), (3, 3, 1e308, 2), (3, 3, 1e308, 2), (3, 4, 0.5, 1), (4, 5, 1, 1), (4, 6, 2, 1), (4, 6, 3, 1), (5, 7, 'NaN', 1), (5, 8, 2, 1), (5, 8, 0, 1);
+
+statement ok
+CREATE MACRO fv27q() AS TABLE
+  SELECT 'full' AS q, a.x AS i, b.x AS j, SUM(a.v * b.v) AS c, 0::DOUBLE AS n FROM fv27 a JOIN fv27 b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'lt', a.x, b.x, SUM(a.v * b.v), 0 FROM fv27 a JOIN fv27 b ON a.k = b.k AND a.x < b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'le', a.x, b.x, SUM(a.v * b.v), 0 FROM fv27 a JOIN fv27 b ON a.k = b.k AND a.x <= b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'ne', a.x, b.x, SUM(a.v * b.v), 0 FROM fv27 a JOIN fv27 b ON a.k = b.k AND a.x <> b.x GROUP BY a.x, b.x
+  UNION ALL SELECT 'cross', a.x, b.k, SUM(a.v * b.u), 0 FROM fv27 a JOIN fv27 b ON a.k = b.k GROUP BY a.x, b.k
+  UNION ALL SELECT 'two', a.x, b.x, SUM(a.v * b.v), COUNT(*)::DOUBLE FROM fv27 a JOIN fv27 b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'chain', a.x, b.x, SUM(a.v * a.u * b.v), SUM(a.v * b.v) FROM fv27 a JOIN fv27 b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'reassociated', a.x, b.x, SUM(a.v * b.v * a.u), SUM(a.v * b.v) FROM fv27 a JOIN fv27 b ON a.k = b.k GROUP BY a.x, b.x
+  UNION ALL SELECT 'nested', a.x, b.x, SUM(a.v * (b.v * a.u)), SUM(a.v * b.v) FROM fv27 a JOIN fv27 b ON a.k = b.k GROUP BY a.x, b.x;
+
+statement ok
+CREATE TABLE with_fv AS SELECT * FROM fv27q();
+
+statement ok
+SET tessera_enabled = false;
+
+statement ok
+CREATE TABLE without_fv AS SELECT * FROM fv27q();
+
+statement ok
+SET tessera_enabled = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM with_fv EXCEPT ALL SELECT * FROM without_fv) UNION ALL (SELECT * FROM without_fv EXCEPT ALL SELECT * FROM with_fv));
+----
+0
+
+query II
+EXPLAIN SELECT a.x, b.x, SUM(a.v * b.v) FROM fv27 a JOIN fv27 b ON a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query II
+EXPLAIN SELECT a.x, b.x, SUM(a.v * a.u * b.v), SUM(a.v * b.v) FROM fv27 a JOIN fv27 b ON a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<REGEX>:.*(TESSERA|Tessera).*
+
+query II
+EXPLAIN SELECT a.x, b.x, SUM(a.v * b.v * a.u), SUM(a.v * b.v) FROM fv27 a JOIN fv27 b ON a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<!REGEX>:.*(TESSERA|Tessera).*
+
+query II
+EXPLAIN SELECT a.x, b.x, SUM(a.v * (b.v * a.u)), SUM(a.v * b.v) FROM fv27 a JOIN fv27 b ON a.k = b.k GROUP BY a.x, b.x;
+----
+physical_plan	<!REGEX>:.*(TESSERA|Tessera).*
+
+statement error
+SELECT a.x, b.x, COUNT(*) AS c, CAST(a.x * 100 AS TINYINT) AS t FROM rv27 a JOIN rv27 b ON a.k = b.k GROUP BY a.x, b.x ORDER BY c DESC LIMIT 1;
+----
+Conversion Error
+
+statement error
+SELECT x, y, t FROM (SELECT a.x AS x, b.x AS y, CAST(b.x * 100 AS TINYINT) AS t, ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) AS n FROM rv27 a JOIN rv27 b ON a.k = b.k GROUP BY a.x, b.x) WHERE n <= 1;
+----
+Conversion Error
+
+statement error
+SELECT x, y FROM (SELECT a.x AS x, b.x AS y, ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC, CAST(b.x * 100 AS TINYINT)) AS n FROM rv27 a JOIN rv27 b ON a.k = b.k GROUP BY a.x, b.x) WHERE n <= 1;
+----
+Conversion Error
+
+query II
+EXPLAIN SELECT a.x, b.x, COUNT(*) AS c FROM rv27 a JOIN rv27 b ON a.k = b.k GROUP BY a.x, b.x HAVING COUNT(*) >= 2;
+----
+physical_plan	<REGEX>:.*Prune: >= 2.*
+
+query II
+EXPLAIN SELECT a.x, b.x, COUNT(*) AS c FROM rv27 a JOIN rv27 b ON a.k = b.k GROUP BY a.x, b.x ORDER BY c DESC LIMIT 3;
+----
+physical_plan	<REGEX>:.*Prune: top 3.*
+
+query II
+EXPLAIN SELECT x, y, n FROM (SELECT a.x AS x, b.x AS y, ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC, b.x) AS n FROM rv27 a JOIN rv27 b ON a.k = b.k GROUP BY a.x, b.x) WHERE n <= 2;
+----
+physical_plan	<REGEX>:.*Prune: rank <= 2.*
+
+query II
+EXPLAIN SELECT x, y, n FROM (SELECT a.x AS x, b.x AS y, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) AS n FROM rv27 a JOIN rv27 b ON a.k = b.k GROUP BY a.x, b.x) WHERE n <= 2;
+----
+physical_plan	<REGEX>:.*Prune: rank <= 2.*
+
+query II
+EXPLAIN SELECT x, y, n FROM (SELECT a.x AS x, b.x AS y, ROW_NUMBER(ORDER BY b.x) OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) AS n FROM rv27 a JOIN rv27 b ON a.k = b.k GROUP BY a.x, b.x) WHERE n <= 1;
+----
+physical_plan	<!REGEX>:.*Prune.*

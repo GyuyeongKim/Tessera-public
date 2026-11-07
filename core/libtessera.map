@@ -1,4 +1,4 @@
-TESSERA_4 {
+TESSERA_5 {
   global:
     tessera_c_*;
     tessera_dict_*;

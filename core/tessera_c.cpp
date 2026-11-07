@@ -32,7 +32,14 @@ struct tessera_query_c {
   int sim_measure = 0;
   double min_sim = 0;
   bool distinct_keys = false;
+  size_t many = 0;
+  int many_pair_op = 0;
+  int64_t group_topk = -1;
+  int group_of = 0;
   bool two = false;
+  bool float_errors = false;
+  bool float_accum = false;
+  double sum_limit = 0;
   int (*pair_pass)(void *, int64_t, int64_t) = nullptr;
   void *pair_ctx = nullptr;
   int pair_bits = 0;
@@ -219,6 +226,86 @@ void tessera_c_set_similarity(tessera_query_c *h, int measure, double min_sim) {
 
 void tessera_c_set_distinct_keys(tessera_query_c *h, int on) { h->distinct_keys = on != 0; }
 
+void tessera_c_set_float_errors(tessera_query_c *h, int on) {
+  if (!h->ran) h->float_errors = on != 0;
+}
+
+void tessera_c_set_float_accum(tessera_query_c *h, int on) {
+  if (!h->ran) h->float_accum = on != 0;
+}
+
+int tessera_c_float_errors(const tessera_query_c *h) { return h->res.float_errors; }
+
+void tessera_c_set_sum_limit(tessera_query_c *h, double limit) {
+  if (!h->ran) h->sum_limit = limit;
+}
+
+void tessera_c_set_many(tessera_query_c *h, size_t n_sums, int pair_op) {
+  if (h->ran) return;
+  h->many = n_sums;
+  h->many_pair_op = pair_op;
+}
+
+int tessera_c_add_many(tessera_query_c *h, int second_input, const int64_t *k, const int64_t *x, const double *values,
+                       size_t n) {
+  if (h->ran || !h->cross || h->many == 0) return -1;
+  auto &parts = second_input ? h->parts_y : h->parts;
+  if (parts.empty()) return -1;
+  tessera::QueryPart *p = parts.back().get();
+  const size_t n0 = p->k.size();
+  try {
+    p->sum_v.resize(h->many);
+    p->sum_iv.resize(h->many);
+    p->k.insert(p->k.end(), k, k + n);
+    p->x.insert(p->x.end(), x, x + n);
+    for (size_t s = 0; s < h->many; s++) {
+      auto &d = p->sum_v[s];
+      d.reserve(d.size() + n);
+      for (size_t r = 0; r < n; r++) {
+        d.push_back(values[r * h->many + s]);
+      }
+    }
+    return 0;
+  } catch (...) {
+    p->k.resize(n0);
+    p->x.resize(n0);
+    for (auto &d : p->sum_v) {
+      if (d.size() > n0) d.resize(n0);
+    }
+    return -1;
+  }
+}
+
+size_t tessera_c_next_many(tessera_query_c *h, int64_t *x0, int64_t *x1, int64_t *count, double *sums, size_t cap) {
+  if (h->many == 0 || h->res.stride < 2) return 0;
+  const size_t stride = h->res.stride, m = h->many;
+  const int64_t *orig = h->res.orig.data();
+  const std::vector<tessera::Cells> &out = h->res.out;
+  size_t n = 0;
+  while (n < cap && h->c < out.size()) {
+    if (h->q >= out[h->c].n / stride) {
+      h->c++;
+      h->q = 0;
+      continue;
+    }
+    const tessera::Triple *t = out[h->c].data.get() + h->q * stride;
+    x0[n] = orig[t->i];
+    x1[n] = orig[t->j];
+    count[n] = (int64_t)t->s;
+    for (size_t s = 0; s < m; s++) {
+      memcpy(&sums[n * m + s], &t[h->res.sums[s].at].s, sizeof(double));
+    }
+    n++;
+    h->q++;
+  }
+  return n;
+}
+
+void tessera_c_set_group_top(tessera_query_c *h, int64_t k, int of) {
+  h->group_topk = k > 0 ? k : -1;
+  h->group_of = of;
+}
+
 void tessera_c_set_pair_filter(tessera_query_c *h, int (*pass)(void *ctx, int64_t a, int64_t b), void *ctx,
                                 int product_bits) {
   if (h->ran) return;
@@ -310,6 +397,9 @@ int tessera_c_run(tessera_query_c *h, int mode, int col0_smaller, uint64_t min_v
       s.prod_hi = ((__int128)1 << (h->pair_bits - 1)) - 1;
       s.prod_lo = -s.prod_hi - 1;
     }
+    s.float_errors = h->float_errors;
+    s.float_accum = h->float_accum;
+    s.sum_limit = h->sum_limit;
     s.out_budget = h->out_budget;
     s.spill_dir = h->spill_dir;
     s.spill_limit = h->spill_limit;
@@ -319,6 +409,10 @@ int tessera_c_run(tessera_query_c *h, int mode, int col0_smaller, uint64_t min_v
     s.similarity = (tessera::Similarity)h->sim_measure;
     s.min_sim = h->min_sim;
     s.distinct_keys = h->distinct_keys;
+    if (h->group_of >= 0 && h->group_of <= 4) {
+      s.group_topk = h->group_topk;
+      s.group_of = (tessera::GroupOf)h->group_of;
+    }
     h->mode = s.mode;
     h->col0_smaller = col0_smaller != 0;
     auto recode = [](tessera_dict_c *d, std::vector<std::unique_ptr<tessera::QueryPart>> &parts, bool order) {
@@ -338,7 +432,21 @@ int tessera_c_run(tessera_query_c *h, int mode, int col0_smaller, uint64_t min_v
       s.mode = tessera::PairMode::FULL;
       h->mode = s.mode;
     }
-    if (h->two) {
+    if (h->many > 0) {
+      if (!h->cross || h->has_value) throw std::runtime_error("tessera: several sums need a cross product without values");
+      s.has_value = false;
+      s.min_value = 0;
+      s.topk = -1;
+      s.group_topk = -1;
+      s.many_pair_op = h->many_pair_op;
+      for (auto *ps : {&h->parts, &h->parts_y}) {
+        for (auto &p : *ps) {
+          p->sum_v.resize(h->many);
+          p->sum_iv.resize(h->many);
+        }
+      }
+      tessera::run_query_many(h->parts, h->parts_y, h->many, s, h->res);
+    } else if (h->two) {
       tessera::run_query_two(h->parts, h->cross ? &h->parts_y : nullptr, s, h->res);
     } else if (h->cross) {
       tessera::run_query_cross(h->parts, h->parts_y, s, h->res);
