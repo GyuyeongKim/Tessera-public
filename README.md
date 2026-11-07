@@ -279,9 +279,9 @@ on macOS in a process without such a library.
 |---|---|---|
 | `tessera_enabled` | `true` | Use Tessera for matching queries |
 | `tessera_frontier` | `-1` | Number of most frequent values on the matrix accelerator (`-1`: cost model) |
-| `tessera_min_expansion` | `4` | Leave a self-join to DuckDB below this many estimated joined rows per input row |
-| `tessera_min_expansion_cross` | `4` | The same for products of two relations |
-| `tessera_min_expansion_measured` | `4` | The same for inputs without distinct counts, on the joined rows the planner counts itself |
+| `tessera_min_expansion` | `6` | Leave a self-join to DuckDB below this many estimated joined rows per input row |
+| `tessera_min_expansion_cross` | `6` | The same for products of two relations |
+| `tessera_min_expansion_measured` | `6` | The same for inputs without distinct counts, on the joined rows the planner counts itself |
 
 Tessera uses DuckDB's `threads`, and output beyond `memory_limit` goes to `temp_directory` within
 `max_temp_directory_size`.

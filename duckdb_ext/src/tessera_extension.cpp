@@ -871,11 +871,11 @@ static unique_ptr<LogicalOperator> *ArgMaxTopBelow(LogicalAggregate &top, Tesser
 	return s;
 }
 
-static constexpr double MIN_EXPANSION = 4.0;
-static constexpr double MIN_EXPANSION_CROSS = 4.0;
+static constexpr double MIN_EXPANSION = 6.0;
+static constexpr double MIN_EXPANSION_CROSS = 6.0;
 static constexpr idx_t SAMPLE_ROWS = idx_t(1) << 18;
 static constexpr idx_t PANDAS_MORSEL_ROWS = 50 * STANDARD_VECTOR_SIZE;
-static constexpr double MIN_EXPANSION_MEASURED = 4.0;
+static constexpr double MIN_EXPANSION_MEASURED = 6.0;
 static double TableRows(ClientContext &context, LogicalGet &g) {
 	if (!g.function.cardinality) {
 		return -1;
