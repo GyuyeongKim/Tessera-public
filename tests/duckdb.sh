@@ -20,6 +20,7 @@ CREATE TABLE s AS
   FROM range(30000);
 CREATE TABLE u AS SELECT DISTINCT k, x FROM r;
 SQL
+"$DUCK" "$DB" -c "COPY (SELECT k, x FROM r ORDER BY x) TO '$W/r.parquet' (FORMAT parquet);" > /dev/null || { echo "FAIL setup"; exit 1; }
 
 fails=0
 CK="count(*), sum(s)::HUGEINT, sum(s::HUGEINT * hash(i, j))"
@@ -79,6 +80,12 @@ check null_distinct_from "" "SELECT a.xn AS i, b.xn AS j, COUNT(*) AS s $SELF AN
   GROUP BY a.xn, b.xn"
 check filters "" "SELECT a.x AS i, b.y AS j, SUM(a.v * b.w) AS s FROM r a, s b WHERE a.k = b.k AND a.v > 2 AND b.w < 3
   GROUP BY a.x, b.y"
+
+check parquet_file "" "SELECT a.x AS i, b.x AS j, COUNT(*) AS s FROM '$W/r.parquet' a JOIN '$W/r.parquet' b ON a.k = b.k GROUP BY a.x, b.x"
+check rank_per_group "" "SELECT i, j, s FROM (SELECT a.x AS i, b.x AS j, COUNT(*) AS s, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) AS rn $SELF GROUP BY a.x, b.x) WHERE rn <= 3"
+check row_number_per_group "" "SELECT i, j, s FROM (SELECT a.x AS i, b.x AS j, COUNT(*) AS s, ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC, b.x) AS rn $SELF GROUP BY a.x, b.x) WHERE rn <= 5"
+check cosine "" "SELECT a.x AS i, b.x AS j, SUM(a.v * b.v) / (sqrt(SUM(a.v * a.v)) * sqrt(SUM(b.v * b.v))) AS s $SELF GROUP BY a.x, b.x" \
+  "count(*), sum(round(s * 1000000))::HUGEINT, sum(round(s * 1000000)::HUGEINT * hash(i, j))"
 
 sim() {
   local name=$1 measure=$2 t=$3 formula=$4

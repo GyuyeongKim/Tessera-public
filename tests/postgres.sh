@@ -84,6 +84,9 @@ check group_three "" "SELECT a.x % 3 c, a.x i, b.y j, COUNT(*) s FROM r a, s b W
 check null_groups "" "SELECT a.xn i, b.xn j, COUNT(*) s $SELF GROUP BY a.xn, b.xn"
 check null_distinct_from "" "SELECT a.xn i, b.xn j, COUNT(*) s $SELF AND a.xn IS DISTINCT FROM b.xn GROUP BY a.xn, b.xn"
 check filters "" "SELECT a.x i, b.y j, SUM(a.v * b.w) s FROM r a, s b WHERE a.k = b.k AND a.v > 2 AND b.w < 3 GROUP BY a.x, b.y"
+check rank_per_group "" "SELECT i, j, s FROM (SELECT a.x i, b.x j, COUNT(*) s, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) rn $SELF GROUP BY a.x, b.x) q WHERE rn <= 3"
+check row_number_per_group "" "SELECT i, j, s FROM (SELECT a.x i, b.x j, COUNT(*) s, ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC, b.x) rn $SELF GROUP BY a.x, b.x) q WHERE rn <= 5"
+check cosine "" "SELECT a.x i, b.x j, SUM(a.v * b.v) / (sqrt(SUM(a.v * a.v)) * sqrt(SUM(b.v * b.v))) s $SELF GROUP BY a.x, b.x"
 check subquery_input "" "SELECT a.x i, b.y j, COUNT(*) s FROM (SELECT * FROM r WHERE x < 300) a JOIN s b ON a.k = b.k
   GROUP BY a.x, b.y"
 

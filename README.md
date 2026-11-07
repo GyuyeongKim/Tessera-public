@@ -13,6 +13,9 @@
 
 ## News
 
+- **[2026/11]** Tessera 1.4.0 runs on pandas DataFrames and on Parquet and CSV files at DuckDB's default settings, keeps
+  the top values of each group inside the operator (`RANK() ... <= k`), and computes a cosine or a Pearson correlation in
+  one pass. See [Supported queries](#supported-queries).
 - **[2026/11]** Tessera 1.3.0 runs many more join-aggregate forms: `<>` and `IS DISTINCT FROM` between the two sides,
   `COUNT(DISTINCT k)`, `AVG`, keys and groups of several columns or computed from a column, NULL groups, filters on
   the inputs, and date, timestamp, and decimal columns. PostgreSQL and Spark now prune with `HAVING` and
@@ -101,7 +104,7 @@ linear algebra (54.3 s against 2.9 s on the news articles). Release 1.1.1 reruns
 |---|---|---|
 | SQLite in Python | [`sqlite-tessera`](https://pypi.org/project/sqlite-tessera/) on PyPI | `pip install sqlite-tessera` |
 | SQLite | `tessera-sqlite-<version>-<platform>.tar.gz` on the [releases page](https://github.com/GyuyeongKim/Tessera-public/releases) | `.load ./tessera` in the shell |
-| Spark | `io.github.gyuyeongkim:tessera-spark_2.13` on Maven Central | `--packages io.github.gyuyeongkim:tessera-spark_2.13:1.3.0` |
+| Spark | `io.github.gyuyeongkim:tessera-spark_2.13` on Maven Central | `--packages io.github.gyuyeongkim:tessera-spark_2.13:1.4.0` |
 | PostgreSQL | [`tessera_pg`](https://pgxn.org/dist/tessera_pg/) on PGXN | `pgxn install tessera_pg` |
 | DuckDB | [`tessera`](https://duckdb.org/community_extensions/extensions/tessera.html) in the community extensions | `INSTALL tessera FROM community; LOAD tessera;` |
 
@@ -179,10 +182,17 @@ one portable build of the sparse path.
   group.
 - Expressions of the groups and aggregates in the select list (`a.c || '-' || a.x`, `COUNT(*) * 2`), `HAVING`,
   `ORDER BY agg DESC LIMIT n [OFFSET m]`, window functions above the aggregate, and `SELECT DISTINCT a.x, b.x`.
+- The top values of each group, `RANK()` or `ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY agg DESC) <= k`: the window
+  stays above, and the operator keeps only the cells that can reach it. DuckDB, PostgreSQL, and Spark.
+- Several different sums in one query, computed in one pass over the joined rows, such as a cosine
+  (`SUM(a.v * b.v) / (sqrt(SUM(a.v * a.v)) * sqrt(SUM(b.v * b.v)))`) or a Pearson correlation. Floating-point weights in
+  DuckDB, PostgreSQL, and Spark, and integers in DuckDB. Each sum must be a product over one side or a product of one
+  side's and the other's, written left to right.
 - Filters on either side or on both, with different filters on the two sides.
 - Inputs: tables; in PostgreSQL also row-level security, partitioned and inherited tables, subqueries, views, CTEs,
-  set-returning functions, foreign tables and `TABLESAMPLE`; in DuckDB also table functions such as `read_csv`, a
-  subquery's `DISTINCT` or aggregate, and the last join of three relations; in Spark any plan.
+  set-returning functions, foreign tables and `TABLESAMPLE`; in DuckDB also pandas DataFrames, Parquet and CSV files
+  (see [Engines](#engines)), Arrow tables and Polars frames, table functions such as `read_csv`, CTEs, a subquery's
+  `DISTINCT` or aggregate, and the last join of three relations; in Spark any plan.
 - Item similarity (cosine, Jaccard, Dice, overlap) above a threshold.
 
 Keys and groups can be integers, strings, dates and timestamps, and, held as their text, decimals, booleans and in
@@ -209,6 +219,8 @@ These run as the engine's own plan, with the same result:
 
 - `MIN` and `MAX`, which need another semiring than the matrix engine's multiply and add, outer joins, and a third
   relation outside DuckDB's last join;
+- in DuckDB, sums that each read one side and no product across the two (`SUM(a.v), SUM(b.v)`), which DuckDB computes
+  below the join;
 - nondeterministic collations, whose equality is not equality of bytes;
 - in PostgreSQL and Spark, `SUM` of `real` / `float` products, which those engines sum in float32.
 
@@ -267,11 +279,19 @@ on macOS in a process without such a library.
 |---|---|---|
 | `tessera_enabled` | `true` | Use Tessera for matching queries |
 | `tessera_frontier` | `-1` | Number of most frequent values on the matrix accelerator (`-1`: cost model) |
-| `tessera_min_expansion` | `6` | Leave a self-join to DuckDB below this many estimated joined rows per input row |
-| `tessera_min_expansion_cross` | `6` | The same for products of two relations |
+| `tessera_min_expansion` | `4` | Leave a self-join to DuckDB below this many estimated joined rows per input row |
+| `tessera_min_expansion_cross` | `4` | The same for products of two relations |
+| `tessera_min_expansion_measured` | `4` | The same for inputs without distinct counts, on the joined rows the planner counts itself |
 
 Tessera uses DuckDB's `threads`, and output beyond `memory_limit` goes to `temp_directory` within
 `max_temp_directory_size`.
+
+A pandas DataFrame or a Parquet or CSV file has no distinct counts, so the planner reads about 262,144 rows of each input
+and counts the joined rows itself. It reads a little of every row group of a local Parquet file and of every part of a
+DataFrame, so a file sorted by another column is measured like any other. It reads from the start where it cannot skip
+ahead: CSV files, remote files, inputs with a pushed filter, and several files without `parquet_metadata_cache`; a join
+that looks small there stays with DuckDB, with the same result. Arrow readers are read once only, so Arrow tables and
+Polars frames stay with DuckDB unless `tessera_min_expansion_cross` is set to `0`.
 
 ```sql
 SELECT * FROM tessera_sim('t', 'k', 'x', 'jaccard', 0.5);

@@ -45,7 +45,7 @@ CACHE TABLE t AS SELECT k, k2, c, x, CAST((x - 300) * 1000003 AS BIGINT) AS a,
   CASE WHEN x % 2 = 0 THEN -4611686018427387904L + x ELSE 4611686018427387903L - x END AS wa,
   CASE x % 3 WHEN 0 THEN -9223372036854775807L - 1L WHEN 1 THEN 9223372036854775807L ELSE 0L END AS ex,
   CASE WHEN x % 5 = 0 THEN NULL ELSE x - 250 END AS n, k2 - 5 AS kn, CAST(k AS BIGINT) AS kl,
-  date_add(DATE'1960-01-01', x - 200) AS dt, timestamp_seconds(-100000 + k) AS kt, iv
+  date_add(DATE'1960-01-01', x - 200) AS dt, timestamp_seconds(-100000 + k) AS kt, iv, CAST(iv AS DOUBLE) AS dv
   FROM (SELECT coalesce(CAST(rand(11) * 500 AS INT), 0) AS k, coalesce(CAST(floor(rand(15) * 3) AS INT), 0) AS k2,
   coalesce(CAST(floor(rand(14) * 4) AS INT), 0) AS c, coalesce(CAST(pow(rand(12), 3) * 600 AS INT), 0) AS x,
   coalesce(CAST(1 + floor(rand(17) * 5) AS BIGINT), 1L) AS iv FROM range(20000));
@@ -82,6 +82,9 @@ count_and_sum|count(*), sum(s), sum(s2), sum(s * i)|SELECT a.x AS i, b.x AS j, C
 having|count(*), sum(s), sum(s * i), sum(s * j)|SELECT a.x AS i, b.x AS j, COUNT(*) AS s FROM t a, t b WHERE a.k = b.k AND a.x < b.x GROUP BY a.x, b.x HAVING COUNT(*) >= 5
 top_k|count(*), sum(s)|SELECT a.x AS i, b.x AS j, COUNT(*) AS s FROM t a, t b WHERE a.k = b.k GROUP BY a.x, b.x ORDER BY s DESC LIMIT 10
 filters|count(*), sum(s), sum(s * i), sum(s * j)|SELECT a.x AS i, b.x AS j, COUNT(*) AS s FROM t a, t b WHERE a.k = b.k AND a.c = 1 AND b.c <> 1 GROUP BY a.x, b.x
+rank_per_group|count(*), sum(s), sum(s * i), sum(s * j)|SELECT i, j, s FROM (SELECT a.x AS i, b.x AS j, COUNT(*) AS s, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) AS rn FROM t a, t b WHERE a.k = b.k GROUP BY a.x, b.x) WHERE rn <= 3
+row_number_per_group|count(*), sum(s), sum(s * i), sum(s * j)|SELECT i, j, s FROM (SELECT a.x AS i, b.x AS j, COUNT(*) AS s, ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC, b.x) AS rn FROM t a, t b WHERE a.k = b.k GROUP BY a.x, b.x) WHERE rn <= 5
+cosine|count(*), sum(round(s * 1000000)), sum(i), sum(j)|SELECT a.x AS i, b.x AS j, SUM(a.dv * b.dv) / (sqrt(SUM(a.dv * a.dv)) * sqrt(SUM(b.dv * b.dv))) AS s FROM t a, t b WHERE a.k = b.k GROUP BY a.x, b.x
 FORMS
 } > "$W/forms.sql"
 "$SPARK_HOME/bin/spark-sql" --master 'local[*]' --driver-memory "${SPARK_DRIVER_MEMORY:-8g}" --jars "$D/tessera-spark.jar" \
