@@ -3,5 +3,3 @@ duckdb_extension_load(tessera
     LOAD_TESTS
 )
 duckdb_extension_statically_link(tessera)
-
-duckdb_extension_load(parquet)

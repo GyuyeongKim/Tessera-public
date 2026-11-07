@@ -20,12 +20,11 @@ CREATE TABLE s AS
   FROM range(30000);
 CREATE TABLE u AS SELECT DISTINCT k, x FROM r;
 SQL
-"$DUCK" "$DB" -c "COPY (SELECT k, x FROM r ORDER BY x) TO '$W/r.parquet' (FORMAT parquet);" > /dev/null || { echo "FAIL setup"; exit 1; }
 
 fails=0
 CK="count(*), sum(s)::HUGEINT, sum(s::HUGEINT * hash(i, j))"
 check() {
-  local name=$1 pre=$2 q=$3 ck=${4:-$CK} want=${5:-}
+  local name=$1 pre=$2 q=$3 ck=${4:-$CK}
   cat > "$W/q.sql" <<SQL
 $pre
 SELECT 'plan';
@@ -35,15 +34,14 @@ SET tessera_enabled = false;
 SELECT 'off', $ck FROM ($q);
 SQL
   "$DUCK" -readonly -csv -noheader "$DB" < "$W/q.sql" > "$W/q.out" 2>&1
-  local on off plan pruned=1
+  local on off plan
   on=$(grep '^on,' "$W/q.out" | cut -d, -f2-)
   off=$(grep '^off,' "$W/q.out" | cut -d, -f2-)
   plan=$(grep -c -E "TESSERA|─ Tessera " "$W/q.out")
-  [ -z "$want" ] || grep -qF "Prune: $want" "$W/q.out" || pruned=0
-  if [ -n "$on" ] && [ "$on" = "$off" ] && [ "$plan" -gt 0 ] && [ "$pruned" = 1 ]; then
+  if [ -n "$on" ] && [ "$on" = "$off" ] && [ "$plan" -gt 0 ]; then
     echo "ok   $name"
   else
-    echo "FAIL $name: tessera=($on) engine=($off) plan=$plan pruned=$pruned"
+    echo "FAIL $name: tessera=($on) engine=($off) plan=$plan"
     fails=$((fails + 1))
   fi
 }
@@ -54,9 +52,9 @@ check lt "" "SELECT a.x AS i, b.x AS j, COUNT(*) AS s $SELF AND a.x < b.x GROUP 
 check le_sum "" "SELECT a.x AS i, b.x AS j, SUM(a.v * b.v) AS s $SELF AND a.x <= b.x GROUP BY a.x, b.x"
 check gt_sum "" "SELECT a.x AS i, b.x AS j, SUM(a.v * b.v) AS s $SELF AND a.x > b.x GROUP BY a.x, b.x"
 check distinct "" "SELECT i, j, 1 AS s FROM (SELECT DISTINCT a.x AS i, b.x AS j $SELF)"
-check having "" "SELECT a.x AS i, b.x AS j, COUNT(*) AS s $SELF AND a.x < b.x GROUP BY a.x, b.x HAVING COUNT(*) >= 20" "$CK" ">= 20"
+check having "" "SELECT a.x AS i, b.x AS j, COUNT(*) AS s $SELF AND a.x < b.x GROUP BY a.x, b.x HAVING COUNT(*) >= 20"
 check topk "" "SELECT a.x AS i, b.x AS j, COUNT(*) AS s $SELF AND a.x < b.x GROUP BY a.x, b.x ORDER BY s DESC LIMIT 100" \
-  "count(*), sum(s)::HUGEINT" "top 100"
+  "count(*), sum(s)::HUGEINT"
 check strings "" "SELECT a.xs AS i, b.xs AS j, COUNT(*) AS s FROM r a, r b WHERE a.ks = b.ks AND a.xs < b.xs GROUP BY a.xs, b.xs"
 check wide "" "SELECT a.xw AS i, b.xw AS j, SUM(a.v * b.v) AS s FROM r a, r b WHERE a.kw = b.kw GROUP BY a.xw, b.xw"
 check frontier_count "SET tessera_frontier = 512;" "SELECT a.x AS i, b.x AS j, COUNT(*) AS s $SELF GROUP BY a.x, b.x"
@@ -81,12 +79,6 @@ check null_distinct_from "" "SELECT a.xn AS i, b.xn AS j, COUNT(*) AS s $SELF AN
   GROUP BY a.xn, b.xn"
 check filters "" "SELECT a.x AS i, b.y AS j, SUM(a.v * b.w) AS s FROM r a, s b WHERE a.k = b.k AND a.v > 2 AND b.w < 3
   GROUP BY a.x, b.y"
-
-check parquet_file "" "SELECT a.x AS i, b.x AS j, COUNT(*) AS s FROM '$W/r.parquet' a JOIN '$W/r.parquet' b ON a.k = b.k GROUP BY a.x, b.x"
-check rank_per_group "" "SELECT i, j, s FROM (SELECT a.x AS i, b.x AS j, COUNT(*) AS s, RANK() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC) AS rn $SELF GROUP BY a.x, b.x) WHERE rn <= 3" "$CK" "rank <= 3"
-check row_number_per_group "" "SELECT i, j, s FROM (SELECT a.x AS i, b.x AS j, COUNT(*) AS s, ROW_NUMBER() OVER (PARTITION BY a.x ORDER BY COUNT(*) DESC, b.x) AS rn $SELF GROUP BY a.x, b.x) WHERE rn <= 5" "$CK" "rank <= 5"
-check cosine "" "SELECT a.x AS i, b.x AS j, SUM(a.v * b.v) / (sqrt(SUM(a.v * a.v)) * sqrt(SUM(b.v * b.v))) AS s $SELF GROUP BY a.x, b.x" \
-  "count(*), sum(round(s * 1000000))::HUGEINT, sum(round(s * 1000000)::HUGEINT * hash(i, j))"
 
 sim() {
   local name=$1 measure=$2 t=$3 formula=$4

@@ -11,11 +11,10 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Average, Complete, Count, Sum}
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, Limit, LimitAndOffset, LogicalPlan,
-  OffsetAndLimit, Project, ReturnAnswer, Sort, Window, WindowGroupLimit}
+  OffsetAndLimit, Project, ReturnAnswer, Sort}
 import org.apache.spark.sql.execution.{BinaryExecNode, FilterExec, ProjectExec, SparkPlan, SparkStrategy,
   TakeOrderedAndProjectExec, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.LogicalQueryStage
-import org.apache.spark.sql.execution.window.WindowExec
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
@@ -73,9 +72,7 @@ class TesseraExtensions extends (SparkSessionExtensions => Unit) {
 case class TesseraSpec(kinds: Seq[Int], kIdx: Int, xIdx: Int, vIdx: Int, kType: DataType, xType: DataType,
                        vType: DataType, aggType: DataType, mode: Int, col0Smaller: Boolean, simMeasure: Int = 0,
                        minSim: Double = 0.0, vInt: Boolean = false, ansi: Boolean = true, distinctKeys: Boolean = false,
-                       minValue: Long = 0L, topk: Long = -1L, groupTopk: Long = -1L, groupOf: Int = 0)
-
-case class TesseraRankTop(limit: Long, partition: Set[ExprId])
+                       minValue: Long = 0L, topk: Long = -1L)
 
 object TesseraStrategy extends SparkStrategy with PredicateHelper {
   private lazy val cpuOk = TesseraNative.supported()
@@ -88,50 +85,12 @@ object TesseraStrategy extends SparkStrategy with PredicateHelper {
       Seq(TesseraExec(n.output, n.spec, planLater(n.child)))
     case _ if !on => Nil
     case ReturnAnswer(root) => topK(root).toSeq
-    case Filter(cond, a: Aggregate) => tesseraOf(a).map { case (_, build) => FilterExec(cond, build(Some(cond), -1L, None)) }.toSeq
-    case Filter(cond, w: Window) => rankTop(cond, w).toSeq
-    case a: Aggregate => tesseraOf(a).map { case (_, build) => build(None, -1L, None) }.toSeq
+    case Filter(cond, a: Aggregate) => tesseraOf(a).map { case (_, build) => FilterExec(cond, build(Some(cond), -1L)) }.toSeq
+    case a: Aggregate => tesseraOf(a).map { case (_, build) => build(None, -1L) }.toSeq
     case other => topK(other).toSeq
   }
 
-  private def rankTop(cond: Expression, w: Window): Option[SparkPlan] = {
-    val a = w.child match {
-      case WindowGroupLimit(_, _, _, _, c: Aggregate) => c
-      case c: Aggregate => c
-      case _ => return None
-    }
-    val rank = w.windowExpressions match {
-      case Seq(al @ Alias(WindowExpression(_: RowNumber | _: Rank, _), _)) => al.exprId
-      case _ => return None
-    }
-    def isRank(e: Expression) = e match {
-      case at: Attribute => at.exprId == rank
-      case _ => false
-    }
-    val limits = splitConjunctivePredicates(cond).collect {
-      case LessThanOrEqual(r, IntegerLiteral(k)) if isRank(r) => k.toLong
-      case LessThan(r, IntegerLiteral(k)) if isRank(r) => k.toLong - 1
-      case EqualTo(r, IntegerLiteral(1)) if isRank(r) => 1L
-      case GreaterThanOrEqual(IntegerLiteral(k), r) if isRank(r) => k.toLong
-      case GreaterThan(IntegerLiteral(k), r) if isRank(r) => k.toLong - 1
-    }.filter(_ >= 1)
-    val partition = w.partitionSpec.collect { case at: Attribute => at.exprId }.toSet
-    if (limits.isEmpty || !plainCond(cond) || partition.isEmpty || partition.size != w.partitionSpec.size || w.orderSpec.isEmpty ||
-        w.orderSpec.head.direction != Descending) {
-      return None
-    }
-    tesseraOf(a).flatMap { case (cols, build) =>
-      w.orderSpec.head.child match {
-        case at: Attribute if cols(at.exprId) =>
-          val plan = build(None, -1L, Some(TesseraRankTop(limits.min, partition)))
-          Some(FilterExec(cond, WindowExec(w.windowExpressions, w.partitionSpec, w.orderSpec, plan)))
-        case _ => None
-      }
-    }
-  }
-
-  private def tesseraOf(a: Aggregate): Option[(Set[ExprId], (Option[Expression], Long, Option[TesseraRankTop]) => SparkPlan)] = {
-    def outputKinds(partition: Set[ExprId]) = a.output.zipWithIndex.collect { case (at, i) if partition(at.exprId) => i }
+  private def tesseraOf(a: Aggregate): Option[(Set[ExprId], (Option[Expression], Long) => SparkPlan)] = {
     def aggCols(agg: Seq[Boolean]) = agg.zip(a.output).collect { case (true, at) => at.exprId }.toSet
     matchAgg(a) match {
       case Some((spec, left)) =>
@@ -139,17 +98,9 @@ object TesseraStrategy extends SparkStrategy with PredicateHelper {
         else {
           val cols = aggCols(spec.kinds.map(_ == 2))
           val prune = !(spec.vInt && !spec.ansi)
-          def groupOf(r: TesseraRankTop): Option[(Long, Int)] = outputKinds(r.partition).map(spec.kinds) match {
-            case Seq(s) if s < 2 && prune && spec.simMeasure == 0 =>
-              Some((r.limit, if (spec.mode == 0 || spec.mode == 3) 0 else if ((s == 0) == spec.col0Smaller) 1 else 2))
-            case _ => None
-          }
-          Some((cols, (having: Option[Expression], topk: Long, rank: Option[TesseraRankTop]) => {
-            val g = rank.flatMap(groupOf)
+          Some((cols, (having: Option[Expression], topk: Long) =>
             TesseraExec(a.output, spec.copy(minValue = if (prune) minValue(having, cols) else 0L,
-              topk = if (prune) topk else -1L, groupTopk = g.map(_._1).getOrElse(-1L), groupOf = g.map(_._2).getOrElse(0)),
-              planLater(left))
-          }))
+              topk = if (prune) topk else -1L), planLater(left))))
         }
       case None =>
         TesseraCross.matchCross(a).filter { case (spec, xp, yp, _, _, _) =>
@@ -161,40 +112,17 @@ object TesseraStrategy extends SparkStrategy with PredicateHelper {
           }
           val cols = if (proj.isDefined) Set.empty[ExprId] else aggCols(spec.kinds.map(_._1 == 2))
           val prune = spec.two || !(spec.vInt && !spec.ansi)
-          def groupOf(r: TesseraRankTop): Option[(Long, Int)] = {
-            val parts = outputKinds(r.partition).map(spec.kinds)
-            val side = parts.headOption.map(_._1).getOrElse(-1)
-            val whole = side >= 0 && side < 2 && parts.forall(_._1 == side) &&
-              parts.size == (if (side == 0) spec.xIdx.size else spec.yIdx.size)
-            if (whole && prune && !spec.two && spec.filters.isEmpty && proj.isEmpty && !spec.kinds.exists(_._1 > 2)) {
-              Some((r.limit, if (spec.symmetric) 0 else if (side == 0) 3 else 4))
-            } else None
-          }
-          (cols, (having: Option[Expression], topk: Long, rank: Option[TesseraRankTop]) => {
-            val g = rank.flatMap(groupOf)
+          (cols, (having: Option[Expression], topk: Long) => {
             val exec = TesseraCrossExec(proj.map(_._1).getOrElse(a.output), spec.copy(
               minValue = if (prune) minValue(having, cols) else 0L,
-              topk = if (prune && spec.filters.isEmpty && proj.isEmpty) topk else -1L,
-              groupTopk = g.map(_._1).getOrElse(-1L), groupOf = g.map(_._2).getOrElse(0)), input(xp, xb), input(yp, yb))
+              topk = if (prune && spec.filters.isEmpty && proj.isEmpty) topk else -1L), input(xp, xb), input(yp, yb))
             proj.map { case (_, list) => ProjectExec(list, exec) }.getOrElse(exec)
           })
         }
     }
   }
 
-  private def plainCond(e: Expression): Boolean = e match {
-    case And(l, r) => plainCond(l) && plainCond(r)
-    case Or(l, r) => plainCond(l) && plainCond(r)
-    case Not(c) => plainCond(c)
-    case IsNull(_: Attribute) | IsNotNull(_: Attribute) => true
-    case b: BinaryComparison =>
-      def plain(o: Expression) = o.isInstanceOf[Attribute] || o.isInstanceOf[Literal]
-      plain(b.left) && plain(b.right)
-    case _ => false
-  }
-
   private def minValue(cond: Option[Expression], cols: Set[ExprId]): Long = {
-    if (!cond.forall(plainCond)) return 0L
     def boundOf(l: Literal): Long = {
       val d = l.value match {
         case n: java.lang.Number => n.doubleValue
@@ -236,7 +164,7 @@ object TesseraStrategy extends SparkStrategy with PredicateHelper {
         }
         if (ordered.isEmpty) None
         else {
-          val t = build(having, if (lowerBoundsOn(having, ordered.get)) limit.toLong else -1L, None)
+          val t = build(having, if (lowerBoundsOn(having, ordered.get)) limit.toLong else -1L)
           Some(TakeOrderedAndProjectExec(limit, order, projectList.getOrElse(child.output),
             having.map(FilterExec(_, t)).getOrElse(t), offset))
         }
@@ -397,8 +325,7 @@ object TesseraStrategy extends SparkStrategy with PredicateHelper {
 }
 
 case class TesseraPart(n: Int, k: Array[Long], kBytes: Array[Byte], kOffs: Array[Int], x: Array[Long],
-                       xBytes: Array[Byte], xOffs: Array[Int], v: Array[Double], iv: Array[Long] = null,
-                       many: Array[Double] = null)
+                       xBytes: Array[Byte], xOffs: Array[Int], v: Array[Double], iv: Array[Long] = null)
 
 object TesseraPairFilter {
   def cols(v: Long, dict: Boolean, b: Array[Byte], o: Array[Long], t: Seq[DataType], nulls: Seq[Boolean]): Array[Any] =
@@ -493,8 +420,7 @@ case class TesseraCrossSpec(kinds: Seq[(Int, Int)], kx: Seq[Int], ky: Seq[Int], 
                             filters: Seq[(Int, Int, Int)] = Nil, two: Boolean = false, sumType: DataType = NullType,
                             symmetric: Boolean = false, sumCheck: Boolean = true, dec: Boolean = false,
                             decScale: Int = 0, avgAnsi: Boolean = true, decArgPrec: Int = 0, xNull: Seq[Boolean] = Nil,
-                            yNull: Seq[Boolean] = Nil, groupTopk: Long = -1L, groupOf: Int = 0,
-                            manySums: Seq[(Seq[Int], Seq[Int])] = Nil) {
+                            yNull: Seq[Boolean] = Nil) {
   private def single(t: Seq[DataType]) = t.size == 1 && TesseraCross.heldAsLong(t.head)
   def kStr: Boolean = !single(kxTypes)
   def xDict: Boolean = !single(xTypes) || xNull.contains(true)
@@ -857,54 +783,7 @@ object TesseraCross extends PredicateHelper {
       if (!project) parts ++= outs
       else for (o <- outs; p <- partsOf(o)) if (!parts.exists(_.semanticEquals(p))) parts += p
       if (project && outs.exists(o => !o.deterministic)) return None
-      val sumExprs = parts.collect { case ae @ AggregateExpression(_: Sum, Complete, false, None, _) => ae }
-      val differ = sumExprs.exists(!_.semanticEquals(sumExprs.head))
-      val manySums = ArrayBuffer[(Seq[Int], Seq[Int])]()
-      val manyAggs = ArrayBuffer[Expression]()
-      def factor(e: Expression): Option[Seq[(Int, Int)]] = pos(castCol(e)).filter { case (i, side) =>
-        val p = if (side == sx) xp else yp
-        p.output(i).dataType == DoubleType && notNull(p, p.output(i))
-      }.map(Seq(_))
-      def chain(e: Expression): Option[Seq[(Int, Int)]] = (e match {
-        case m: Multiply if m.dataType == DoubleType => (m.left, m.right) match {
-          case (_: Multiply, _: Multiply) => None
-          case (l, r: Multiply) => for (a <- chain(r); b <- factor(l)) yield a ++ b
-          case (l, r) => for (a <- chain(l); b <- factor(r)) yield a ++ b
-        }
-        case _ => factor(e)
-      }).filter(_.map(f => f._2 == sx).distinct.size == 1)
-      def factors(e: Expression): Option[Seq[(Int, Int)]] = chain(e).orElse(e match {
-        case m: Multiply if m.dataType == DoubleType =>
-          for (a <- chain(m.left); b <- chain(m.right) if (a.head._2 == sx) != (b.head._2 == sx)) yield a ++ b
-        case _ => None
-      })
-      if (differ) for (inner <- parts) {
-        pos(inner) match {
-          case Some((i, s)) if s == sx && xIdx.contains(i) => kinds += ((0, xIdx.indexOf(i)))
-          case Some((i, s)) if s != sx && yIdx.contains(i) => kinds += ((1, yIdx.indexOf(i)))
-          case Some(_) => return None
-          case None =>
-            inner match {
-              case ae: AggregateExpression if countAgg.exists(_.semanticEquals(ae)) => kinds += ((2, 0))
-              case AggregateExpression(c: Count, Complete, false, None, _) if countAgg.isEmpty && c.children.size == 1 &&
-                  TesseraStrategy.countsAll(c.children.head, l, r) =>
-                countAgg = Some(inner)
-                kinds += ((2, 0))
-              case ae: AggregateExpression if manyAggs.exists(_.semanticEquals(ae)) =>
-                kinds += ((5, manyAggs.indexWhere(_.semanticEquals(ae))))
-              case ae @ AggregateExpression(f: Sum, Complete, false, None, _) if f.dataType == DoubleType =>
-                factors(f.child) match {
-                  case Some(fs) =>
-                    val (xf, yf) = fs.partition(_._2 == sx)
-                    manySums += ((xf.map(_._1), yf.map(_._1)))
-                    manyAggs += ae
-                    kinds += ((5, manySums.size - 1))
-                  case None => return None
-                }
-              case _ => return None
-            }
-        }
-      } else for (inner <- parts) {
+      for (inner <- parts) {
         pos(inner) match {
           case Some((i, s)) if s == sx && xIdx.contains(i) => kinds += ((0, xIdx.indexOf(i)))
           case Some((i, s)) if s != sx && yIdx.contains(i) => kinds += ((1, yIdx.indexOf(i)))
@@ -943,9 +822,9 @@ object TesseraCross extends PredicateHelper {
             }
         }
       }
-      if (countAgg.isEmpty && sumAgg.isEmpty && avgAgg.isEmpty && !differ) return None
+      if (countAgg.isEmpty && sumAgg.isEmpty && avgAgg.isEmpty) return None
       if (avgAgg.isDefined && distinct) return None
-      val two = differ || Seq(countAgg, sumAgg, avgAgg).count(_.isDefined) >= 2 || avgAgg.isDefined
+      val two = Seq(countAgg, sumAgg, avgAgg).count(_.isDefined) >= 2 || avgAgg.isDefined
       if (!two) {
         for (i <- kinds.indices if kinds(i)._1 == 3) kinds(i) = (2, 0)
         if (countAgg.isDefined) aggType = LongType
@@ -955,7 +834,7 @@ object TesseraCross extends PredicateHelper {
         if (sumType != LongType && sumType != DoubleType && !(dec && sumType.isInstanceOf[DecimalType])) return None
       }
       if (aggType != LongType && aggType != DoubleType && !(dec && aggType.isInstanceOf[DecimalType])) return None
-      val symmetric = !differ && TesseraStrategy.sameInput(xp, yp) && kx == ky && xIdx == yIdx && xNull == yNull &&
+      val symmetric = TesseraStrategy.sameInput(xp, yp) && kx == ky && xIdx == yIdx && xNull == yNull &&
         (if (hasValue) vIdx >= 0 && vIdx == wIdx else true)
       if (SQLConf.get.getConfString("spark.tessera.verbose", "false").toBoolean) {
         System.err.println(s"tessera: general form: same input ${TesseraStrategy.sameInput(xp, yp)}, keys $kx / $ky, " +
@@ -985,21 +864,19 @@ object TesseraCross extends PredicateHelper {
         if (wIdx >= 0) yp.output(wIdx).dataType else if (vIdx >= 0) xp.output(vIdx).dataType else NullType,
         aggType, hasValue, vInt = hasValue && vInt, ansi = ansi, distinctKeys = distinct, filters = filters.toSeq,
         two = two, sumType = sumType, symmetric = symmetric, sumCheck = sumAgg.isDefined, dec = dec, decScale = decScale,
-        avgAnsi = avgAnsi, decArgPrec = decArgPrec, xNull = xNull, yNull = yNull, manySums = manySums.toSeq), xp, yp, proj,
+        avgAnsi = avgAnsi, decArgPrec = decArgPrec, xNull = xNull, yNull = yNull), xp, yp, proj,
         if (sx == 0) j.left else j.right, if (sx == 0) j.right else j.left))
     case _ => None
   }
 
   def collect(plan: SparkPlan, kIdx: Seq[Int], kTypes: Seq[DataType], gIdx: Seq[Int], gTypes: Seq[DataType], vIdx: Int,
-              vType: DataType, hasValue: Boolean, vInt: Boolean, gNull: Seq[Boolean],
-              many: Seq[Seq[Int]] = Nil): Array[TesseraPart] = {
+              vType: DataType, hasValue: Boolean, vInt: Boolean, gNull: Seq[Boolean]): Array[TesseraPart] = {
     val kBytes = !(kIdx.size == 1 && heldAsLong(kTypes.head))
     val gBytes = !(gIdx.size == 1 && heldAsLong(gTypes.head)) || gNull.contains(true)
     val gTuple = gIdx.size > 1 || gNull.contains(true)
     plan.execute().mapPartitions { it =>
       val k = new ArrayBuffer[Long](); val x = new ArrayBuffer[Long](); val v = new ArrayBuffer[Double]()
       val iv = new ArrayBuffer[Long]()
-      val mv = new ArrayBuffer[Double]()
       val kb = new ByteArrayOutputStream(); val xb = new ByteArrayOutputStream()
       val ko = ArrayBuffer[Int](0); val xo = ArrayBuffer[Int](0)
       def bytes(r: InternalRow, idx: Seq[Int], types: Seq[DataType], b: ByteArrayOutputStream, o: ArrayBuffer[Int],
@@ -1022,21 +899,13 @@ object TesseraCross extends PredicateHelper {
             case DoubleType => r.getDouble(vIdx); case FloatType => r.getFloat(vIdx).toDouble
             case t => int(r, vIdx, t).toDouble
           })
-          for (fs <- many) {
-            var d = 1.0
-            for (f <- fs) {
-              if (r.isNullAt(f)) throw new IllegalArgumentException("tessera: NULL group keys or values are not supported")
-              d *= r.getDouble(f)
-            }
-            mv += d
-          }
           n += 1
         }
       }
       Iterator(TesseraPart(n, if (kBytes) null else k.toArray, if (kBytes) kb.toByteArray else null,
         if (kBytes) ko.toArray else null, if (gBytes) null else x.toArray, if (gBytes) xb.toByteArray else null,
         if (gBytes) xo.toArray else null, if (hasValue && !vInt) v.toArray else null,
-        if (hasValue && vInt) iv.toArray else null, if (many.nonEmpty) mv.toArray else null))
+        if (hasValue && vInt) iv.toArray else null))
     }.collect()
   }
 }
@@ -1051,7 +920,7 @@ case class TesseraCrossExec(output: Seq[Attribute], spec: TesseraCrossSpec, left
     s"TesseraExec(cross product, agg=${if (spec.kinds.exists(_._1 == 4)) "AVG(a.v * b.w)" else if (spec.hasValue) "SUM(a.v * b.w)" else if (spec.distinctKeys) "COUNT(DISTINCT k)" else "COUNT(*)"}" +
       (if (spec.kx.size > 1) s", ${spec.kx.size}-column key" else "") +
       (if (spec.filters.nonEmpty) s", ${spec.filters.size} row filters" else "") +
-      (if (spec.minValue > 0) s", prune below ${spec.minValue}" else "") + (if (spec.topk > 0) s", top ${spec.topk}" else "") + (if (spec.groupTopk > 0) s", rank ${spec.groupTopk}" else "") + ")"
+      (if (spec.minValue > 0) s", prune below ${spec.minValue}" else "") + (if (spec.topk > 0) s", top ${spec.topk}" else "") + ")"
 
   override protected def doExecute(): RDD[InternalRow] = {
     val s = spec
@@ -1068,12 +937,9 @@ case class TesseraCrossExec(output: Seq[Attribute], spec: TesseraCrossSpec, left
       System.err.println(f"tessera: general form: $name ${(t1 - t0) / 1e9}%.3f s")
       t0 = t1
     }
-    val nMany = s.manySums.size
-    val xs = TesseraCross.collect(left, s.kx, s.kxTypes, s.xIdx, s.xTypes, s.vIdx, s.vType, s.hasValue, s.vInt, xNull,
-      s.manySums.map(_._1))
+    val xs = TesseraCross.collect(left, s.kx, s.kxTypes, s.xIdx, s.xTypes, s.vIdx, s.vType, s.hasValue, s.vInt, xNull)
     val ys = if (s.symmetric) Array.empty[TesseraPart]
-             else TesseraCross.collect(right, s.ky, s.kyTypes, s.yIdx, s.yTypes, s.wIdx, s.wType, s.hasValue, s.vInt, yNull,
-               s.manySums.map(_._2))
+             else TesseraCross.collect(right, s.ky, s.kyTypes, s.yIdx, s.yTypes, s.wIdx, s.wType, s.hasValue, s.vInt, yNull)
     phase(s"collect (symmetric ${s.symmetric})")
     val threads = TesseraConf.threads(c)
     val alive = org.apache.spark.sql.tessera.TesseraStatement.alive(sparkContext)
@@ -1099,37 +965,26 @@ case class TesseraCrossExec(output: Seq[Attribute], spec: TesseraCrossSpec, left
       }
       def keys(p: TesseraPart) = if (kPack != null) kPack.pack(p.kBytes, p.kOffs, p.n)
                                  else if (kStr) codes(dk, p.kBytes, p.kOffs, p.n) else p.k
-      if (nMany > 0) {
-        val pairOp = if (s.filters.size == 1 && !xStr && !yStr) s.filters.head._3 match {
-          case 0 => 1; case 1 => 2; case 2 => 3; case 3 => 4; case _ => 5
-        } else 0
-        TesseraNative.setMany(h, nMany, pairOp)
-      }
       for (p <- xs if p.n > 0) {
         val k = keys(p)
         val x = if (xPack != null) xPack.pack(p.xBytes, p.xOffs, p.n) else if (xStr) codes(dx, p.xBytes, p.xOffs, p.n) else p.x
-        if ((if (nMany > 0) TesseraNative.addMany(h, false, k, x, p.many, p.n)
-             else if (s.vInt) TesseraNative.addI64(h, k, x, p.iv, p.n) else TesseraNative.add(h, k, x, p.v, p.n)) != 0)
+        if ((if (s.vInt) TesseraNative.addI64(h, k, x, p.iv, p.n) else TesseraNative.add(h, k, x, p.v, p.n)) != 0)
           throw new IllegalStateException("tessera: out of memory (rows)")
       }
       for (p <- ys if p.n > 0) {
         val k = keys(p)
         val y = if (yPack != null) yPack.pack(p.xBytes, p.xOffs, p.n) else if (yStr) codes(dy, p.xBytes, p.xOffs, p.n) else p.x
-        if ((if (nMany > 0) TesseraNative.addMany(h, true, k, y, p.many, p.n)
-             else if (s.vInt) TesseraNative.addYI64(h, k, y, p.iv, p.n) else TesseraNative.addY(h, k, y, p.v, p.n)) != 0)
+        if ((if (s.vInt) TesseraNative.addYI64(h, k, y, p.iv, p.n) else TesseraNative.addY(h, k, y, p.v, p.n)) != 0)
           throw new IllegalStateException("tessera: out of memory (rows)")
       }
       if (xUse) TesseraNative.setXDict(h, dx)
       if (yUse && !s.symmetric) TesseraNative.setYDict(h, dy)
       phase("code and add")
       if (s.distinctKeys) TesseraNative.setDistinctKeys(h, true)
-      if (s.two && nMany == 0) TesseraNative.setTwo(h, true)
+      if (s.two) TesseraNative.setTwo(h, true)
       val rowSums = s.vInt && s.ansi && !s.dec && s.filters.nonEmpty
       val pvt = if (s.vIdx >= 0) s.vType else s.wType
       if (rowSums) TesseraNative.setPairFilter(h, new TesseraPairFilter(h, s, xPack, yPack), if (pvt == LongType) 64 else 32)
-      if (s.groupTopk > 0) TesseraNative.setGroupTop(h, s.groupTopk, s.groupOf)
-      if (s.dec) TesseraNative.setSumLimit(h, math.pow(10.0, math.min(38, s.decArgPrec + 10)))
-      else if (s.vInt) TesseraNative.setSumLimit(h, math.pow(2.0, 63))
       TesseraRun.run(h, alive, TesseraNative.run(h, 0, true, s.minValue, s.topk, threads, -1L, verbose))
       phase("run")
       if (s.vInt && s.ansi && !s.dec) TesseraEvalModes.check(h, pvt, s.sumCheck && !rowSums)
@@ -1143,12 +998,11 @@ case class TesseraCrossExec(output: Seq[Attribute], spec: TesseraCrossSpec, left
         TesseraRun.check(alive)
         val a = new Array[Long](1 << 20); val b = new Array[Long](1 << 20)
         val cnt = if (s.two) new Array[Long](1 << 20) else null
-        val vi = if ((general && !s.two) || nMany > 0) null else new Array[Long](1 << 20)
-        val vd = if (nMany > 0) new Array[Double]((1 << 20) * nMany) else if (general || s.two) new Array[Double](1 << 20) else null
+        val vi = if (general && !s.two) null else new Array[Long](1 << 20)
+        val vd = if (general || s.two) new Array[Double](1 << 20) else null
         val wideRows = s.dec || rowSums
         val hi = if (wideRows) new Array[Long](1 << 20) else null
-        val n = if (nMany > 0) TesseraNative.nextMany(h, a, b, cnt, vd)
-                else if (wideRows && s.two) TesseraNative.next2Wide(h, a, b, cnt, hi, vi, vd)
+        val n = if (wideRows && s.two) TesseraNative.next2Wide(h, a, b, cnt, hi, vi, vd)
                 else if (wideRows) TesseraNative.next128(h, a, b, hi, vi)
                 else if (s.two) TesseraNative.next2(h, a, b, cnt, vi, vd) else TesseraNative.next(h, a, b, vi, vd)
         if (n > 0) chunks += ((a, b, vi, vd, n, cnt, hi))
@@ -1200,7 +1054,6 @@ case class TesseraCrossExec(output: Seq[Attribute], spec: TesseraCrossSpec, left
                 row.update(col, s.kinds(col) match {
                   case (0, i) => typed(xc(i), s.xTypes(i))
                   case (1, j) => typed(yc(j), s.yTypes(j))
-                  case (5, i) => vd(q * nMany + i)
                   case (2, _) if s.two => cnt(q)
                   case (3, _) if s.dec => fit(decSum(hi, vi, q, s.ansi, "try_sum"), types(col), s.ansi)
                   case (3, _) => if (s.sumType == DoubleType) vd(q) else longSum(hi, vi, q)
@@ -1233,7 +1086,7 @@ case class TesseraExec(output: Seq[Attribute], spec: TesseraSpec, child: SparkPl
 
   override def simpleString(maxFields: Int): String =
     s"TesseraExec(mode=${spec.mode}, agg=${if (spec.vIdx >= 0) "SUM(a.v * b.v)" else if (spec.distinctKeys) "COUNT(DISTINCT k)" else "COUNT(*)"}" +
-      (if (spec.minValue > 0) s", prune below ${spec.minValue}" else "") + (if (spec.topk > 0) s", top ${spec.topk}" else "") + (if (spec.groupTopk > 0) s", rank ${spec.groupTopk}" else "") +
+      (if (spec.minValue > 0) s", prune below ${spec.minValue}" else "") + (if (spec.topk > 0) s", top ${spec.topk}" else "") +
       (if (spec.simMeasure > 0) s", similarity=${spec.simMeasure} >= ${spec.minSim})" else ")")
 
   override protected def doExecute(): RDD[InternalRow] = {
@@ -1297,8 +1150,6 @@ case class TesseraExec(output: Seq[Attribute], spec: TesseraSpec, child: SparkPl
       if (xStr) TesseraNative.setXDict(h, dx)
       if (s.simMeasure > 0) TesseraNative.setSimilarity(h, s.simMeasure, s.minSim)
       if (s.distinctKeys) TesseraNative.setDistinctKeys(h, true)
-      if (s.groupTopk > 0) TesseraNative.setGroupTop(h, s.groupTopk, s.groupOf)
-      if (s.vInt) TesseraNative.setSumLimit(h, math.pow(2.0, 63))
       TesseraRun.run(h, alive, TesseraNative.run(h, s.mode, s.col0Smaller, s.minValue, s.topk, threads, -1L, verbose))
       if (s.vInt && s.ansi) TesseraEvalModes.check(h, s.vType)
       val general = TesseraNative.general(h)

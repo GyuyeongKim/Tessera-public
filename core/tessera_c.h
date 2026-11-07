@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define TESSERA_API_VERSION 5
+#define TESSERA_API_VERSION 4
 int tessera_c_api_version(void);
 const char *tessera_c_version(void);
 const char *tessera_c_isa(void);
@@ -52,20 +52,9 @@ size_t tessera_c_ystrings(const tessera_query_c *q, char *bytes, size_t bytes_ca
 void tessera_c_set_keep_threads(tessera_query_c *q, int keep);
 void tessera_c_set_similarity(tessera_query_c *q, int measure, double min_sim);
 void tessera_c_set_distinct_keys(tessera_query_c *q, int on);
-void tessera_c_set_many(tessera_query_c *q, size_t n_sums, int pair_op);
-int tessera_c_add_many(tessera_query_c *q, int second_input, const int64_t *k, const int64_t *x, const double *values,
-                       size_t n);
-size_t tessera_c_next_many(tessera_query_c *q, int64_t *x0, int64_t *x1, int64_t *count, double *sums, size_t cap);
-void tessera_c_set_group_top(tessera_query_c *q, int64_t k, int of);
 void tessera_c_set_two(tessera_query_c *q, int on);
 void tessera_c_set_pair_filter(tessera_query_c *q, int (*pass)(void *ctx, int64_t a, int64_t b), void *ctx,
                                int product_bits);
-void tessera_c_set_float_errors(tessera_query_c *q, int on);
-void tessera_c_set_float_accum(tessera_query_c *q, int on);
-int tessera_c_float_errors(const tessera_query_c *q);
-#define TESSERA_C_ROW_VALUE_OVERFLOW 0x7ff8000000000001ull
-#define TESSERA_C_ROW_VALUE_UNDERFLOW 0x7ff8000000000002ull
-void tessera_c_set_sum_limit(tessera_query_c *q, double limit);
 
 int tessera_c_run(tessera_query_c *q, int mode, int col0_smaller, uint64_t min_value, int64_t topk, int threads,
                   int64_t frontier, int verbose, char *err, size_t errlen);

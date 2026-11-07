@@ -2,7 +2,7 @@
   "name": "tessera_pg",
   "abstract": "Fast join-aggregates over skewed sparse relations inside PostgreSQL",
   "description": "A planner hook that runs join-aggregates such as SELECT a.x, b.x, COUNT(*) FROM r a JOIN r b ON a.k = b.k GROUP BY a.x, b.x, with weights, HAVING, and two relations, as a sparse matrix product with exact results, plus functions for item similarity.",
-  "version": "1.4.0",
+  "version": "1.3.0",
   "maintainer": ["Gyuyeong Kim <skycrawlers2@gmail.com>"],
   "license": "apache_2_0",
   "provides": {

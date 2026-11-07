@@ -15,18 +15,18 @@ else()
   set(TESSERA_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 if(TESSERA_ARCH MATCHES "^(x86_64|AMD64|amd64)$")
-  set_source_files_properties(${T}/tessera_amx.cpp PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=off;-march=sapphirerapids")
+  set_source_files_properties(${T}/tessera_amx.cpp PROPERTIES COMPILE_OPTIONS "-O3;-march=sapphirerapids")
   set_source_files_properties(${T}/tessera_vnni.cpp PROPERTIES COMPILE_OPTIONS
-      "-O3;-ffp-contract=off;-march=x86-64-v4;-mavx512vnni;-mavx512vbmi;-mgfni;-mbmi2")
-  set_source_files_properties(${T}/tessera_avx512.cpp PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=off;-march=x86-64-v4")
+      "-O3;-march=x86-64-v4;-mavx512vnni;-mavx512vbmi;-mgfni;-mbmi2")
+  set_source_files_properties(${T}/tessera_avx512.cpp PROPERTIES COMPILE_OPTIONS "-O3;-march=x86-64-v4")
   set_source_files_properties(${T}/tessera_avx2.cpp ${T}/common.cpp ${T}/query.cpp src/tessera_operator.cpp
-      PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=off;-march=x86-64-v3")
-  set_source_files_properties(${T}/dispatch.cpp PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=off")
+      PROPERTIES COMPILE_OPTIONS "-O3;-march=x86-64-v3")
+  set_source_files_properties(${T}/dispatch.cpp PROPERTIES COMPILE_OPTIONS "-O3")
   set(EXTENSION_SOURCES src/tessera_extension.cpp ${T}/dispatch.cpp ${T}/common.cpp ${T}/query.cpp
       src/tessera_operator.cpp ${T}/tessera_avx2.cpp ${T}/tessera_avx512.cpp ${T}/tessera_vnni.cpp ${T}/tessera_amx.cpp)
 else()
   set_source_files_properties(${T}/tessera_portable.cpp ${T}/dispatch.cpp ${T}/common.cpp ${T}/query.cpp
-      src/tessera_operator.cpp PROPERTIES COMPILE_OPTIONS "-O3;-ffp-contract=off")
+      src/tessera_operator.cpp PROPERTIES COMPILE_OPTIONS "-O3")
   set(EXTENSION_SOURCES src/tessera_extension.cpp ${T}/dispatch.cpp ${T}/common.cpp ${T}/query.cpp
       src/tessera_operator.cpp ${T}/tessera_portable.cpp)
 endif()

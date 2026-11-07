@@ -1,6 +1,6 @@
 O ?= build
 CXX ?= g++
-OPT = -O3 -ffp-contract=off -fopenmp -fPIC -std=c++17 -Wall -Wno-unused-function $(EXTRA)
+OPT = -O3 -fopenmp -fPIC -std=c++17 -Wall -Wno-unused-function $(EXTRA)
 AMX_ARCH ?= -march=sapphirerapids
 BASE_ARCH = -march=x86-64-v3
 CORE = tessera.cpp tessera.hpp
@@ -13,7 +13,7 @@ OBJS = $(O)/common.o $(O)/query.o $(O)/tessera_c.o $(O)/core_avx2.o $(O)/dispatc
   $(O)/core_vnni.o $(O)/core_amx.o
 endif
 
-SOVER = 5
+SOVER = 4
 VERSION = $(shell sed -n 's/.*kVersion = "\(.*\)";/\1/p' tessera.hpp)
 PREFIX ?= /usr/local
 LDFLAGS ?=

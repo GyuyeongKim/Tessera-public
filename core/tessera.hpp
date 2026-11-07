@@ -9,7 +9,7 @@
 
 namespace tessera {
 
-constexpr const char* kVersion = "1.4.0";
+constexpr const char* kVersion = "1.3.0";
 
 struct Csr {
   int32_t n_rows = 0, n_cols = 0;

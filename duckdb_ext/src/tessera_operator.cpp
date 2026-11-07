@@ -112,8 +112,6 @@ public:
 	vector<int64_t> k2, y;
 	vector<double> w;
 	vector<int64_t> iv, iw;
-	std::vector<std::vector<double>> sum_v[2];
-	std::vector<std::vector<int64_t>> sum_iv[2];
 	bool null_x = false, bad_v = false;
 	tessera::StrDict kd, xd, yd;
 };
@@ -128,8 +126,6 @@ public:
 	vector<int64_t> orig;
 	std::vector<tessera::Cells> out;
 	std::vector<std::vector<__int128>> out2;
-	std::vector<tessera::QueryResult::SumResult> sums;
-	size_t stride = 1;
 	bool general2 = false;
 	bool general = false;
 	bool wide = false;
@@ -373,43 +369,6 @@ static void SinkCross(ExecutionContext &context, const TesseraPlanInfo &info, Da
 		} else if (info.has_value) {
 			AppendDouble(context.client, chunk.data[v0 + s], n, keep, s ? l.w : l.v, l.bad_v);
 		}
-		if (!info.sums.empty()) {
-			l.sum_v[s].resize(info.sums.size());
-			l.sum_iv[s].resize(info.sums.size());
-			const size_t kept = (size_t)std::count(keep.begin(), keep.end(), true);
-			idx_t wc = v0;
-			for (idx_t m = 0; m < info.sums.size(); m++) {
-				auto &ms = info.sums[m];
-				const idx_t first = wc + (s ? ms.factors[0] : 0), nf = ms.factors[s];
-				wc += ms.factors[0] + ms.factors[1];
-				if (ms.v_int) {
-					auto &d = l.sum_iv[s][m];
-					if (nf == 0) {
-						d.insert(d.end(), kept, 1);
-					} else {
-						vector<int64_t> t;
-						AppendInt64V(context.client, chunk.data[first], n, keep, t, l.bad_v);
-						d.insert(d.end(), t.begin(), t.end());
-					}
-					continue;
-				}
-				auto &d = l.sum_v[s][m];
-				if (nf == 0) {
-					d.insert(d.end(), kept, 1.0);
-					continue;
-				}
-				vector<double> p;
-				AppendDouble(context.client, chunk.data[first], n, keep, p, l.bad_v);
-				for (idx_t f = 1; f < nf; f++) {
-					vector<double> t;
-					AppendDouble(context.client, chunk.data[first + f], n, keep, t, l.bad_v);
-					for (size_t q = 0; q < t.size(); q++) {
-						p[q] *= t[q];
-					}
-				}
-				d.insert(d.end(), p.begin(), p.end());
-			}
-		}
 	}
 }
 
@@ -482,10 +441,6 @@ SinkCombineResultType PhysicalTessera::Combine(ExecutionContext &context, Operat
 	part_y->x = std::move(l.y);
 	part_y->v = std::move(l.w);
 	part_y->iv = std::move(l.iw);
-	part->sum_v = std::move(l.sum_v[0]);
-	part->sum_iv = std::move(l.sum_iv[0]);
-	part_y->sum_v = std::move(l.sum_v[1]);
-	part_y->sum_iv = std::move(l.sum_iv[1]);
 	vector<int64_t> kmap, xmap, ymap;
 	{
 		lock_guard<mutex> guard(g.lock);
@@ -587,31 +542,6 @@ SinkFinalizeType PhysicalTessera::Finalize(Pipeline &pipeline, Event &event, Cli
 	q.mode = static_cast<tessera::PairMode>(info.mode);
 	q.min_value = info.min_value;
 	q.topk = info.topk;
-	q.group_topk = info.group_topk;
-	q.group_of = static_cast<tessera::GroupOf>(info.group_of);
-	if (!info.sums.empty() && info.filters.size() == 1 && info.xcols.size() == 1 && info.ycols.size() == 1 &&
-	    !info.xcols[0].str && !info.ycols[0].str && !info.xcols[0].nullable && !info.ycols[0].nullable &&
-	    !TesseraPlanInfo::Tuples(info.xcols) && !TesseraPlanInfo::Tuples(info.ycols)) {
-		switch (info.filters[0].op) {
-		case ExpressionType::COMPARE_LESSTHAN:
-			q.many_pair_op = 1;
-			break;
-		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-			q.many_pair_op = 2;
-			break;
-		case ExpressionType::COMPARE_GREATERTHAN:
-			q.many_pair_op = 3;
-			break;
-		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-			q.many_pair_op = 4;
-			break;
-		case ExpressionType::COMPARE_NOTEQUAL:
-			q.many_pair_op = 5;
-			break;
-		default:
-			break;
-		}
-	}
 	q.similarity = static_cast<tessera::Similarity>(info.sim_measure);
 	q.min_sim = info.min_sim;
 	q.threads = g.threads;
@@ -651,9 +581,7 @@ SinkFinalizeType PhysicalTessera::Finalize(Pipeline &pipeline, Event &event, Cli
 	}
 	tessera::QueryResult res;
 	try {
-		if (!info.sums.empty()) {
-			tessera::run_query_many(g.parts, g.parts_y, info.sums.size(), q, res);
-		} else if (info.symmetric) {
+		if (info.symmetric) {
 			q.mode = tessera::PairMode::FULL;
 			if (info.two) {
 				tessera::run_query_two(g.parts, nullptr, q, res);
@@ -693,23 +621,6 @@ SinkFinalizeType PhysicalTessera::Finalize(Pipeline &pipeline, Event &event, Cli
 			                          TypeIdToString((info.two ? info.agg2_type : info.agg_type).InternalType()));
 		}
 	}
-	for (idx_t m = 0; m < info.sums.size(); m++) {
-		auto &r = res.sums[m];
-		__int128 lo, hi;
-		if (!info.sums[m].v_int || !r.int_values) {
-			continue;
-		}
-		if (IntegerRange(info.sums[m].prod_type, lo, hi) && (r.prod_min < lo || r.prod_max > hi)) {
-			throw OutOfRangeException("Overflow in multiplication of %s (tessera: a product of two joined rows)!",
-			                          TypeIdToString(info.sums[m].prod_type.InternalType()));
-		}
-		if (IntegerRange(info.sums[m].sum_type, lo, hi) && (r.cell_min < lo || r.cell_max > hi)) {
-			throw OutOfRangeException("Overflow in SUM of %s (tessera: the sum of a group)!",
-			                          TypeIdToString(info.sums[m].sum_type.InternalType()));
-		}
-	}
-	g.sums = std::move(res.sums);
-	g.stride = res.stride;
 	g.orig = std::move(res.orig);
 	g.out = std::move(res.out);
 	g.general = res.general;
@@ -724,8 +635,7 @@ class TesseraGlobalSource : public GlobalSourceState {
 public:
 	explicit TesseraGlobalSource(TesseraGlobalSink &g, int threads) : threads(threads) {
 		for (uint32_t p = 0; p < g.out.size(); p++) {
-			const size_t n = g.stride > 1 ? g.out[p].n / g.stride : tessera::cell_count(g.out[p], g.wide);
-			for (size_t s = 0; s < n; s += BLOCK) {
+			for (size_t s = 0; s < tessera::cell_count(g.out[p], g.wide); s += BLOCK) {
 				blocks.push_back({p, s});
 			}
 		}
@@ -1136,8 +1046,7 @@ static bool PairPasses(void *ctx, int64_t a, int64_t b) {
 static idx_t EmitCrossGeneral(ClientContext &ctx, const tessera::Triple *cells, size_t s0, size_t s1, const int64_t *orig,
                               const uint8_t *side, const TesseraPlanInfo &info, bool general, bool wide,
                               const tessera::StrDict &xd, const tessera::StrDict &yd, DataChunk &chunk,
-                              const __int128 *sums, bool general2, const std::vector<tessera::QueryResult::SumResult> &many,
-                              size_t stride) {
+                              const __int128 *sums, bool general2) {
 	using Val = ItemVal;
 	const idx_t nx = info.xcols.size(), ny = info.ycols.size();
 	const bool xdict = info.XDict(), ydict = info.symmetric ? xdict : info.YDict();
@@ -1146,7 +1055,7 @@ static idx_t EmitCrossGeneral(ClientContext &ctx, const tessera::Triple *cells, 
 	vector<size_t> qs;
 	const tessera::StrDict &yds = info.symmetric ? xd : yd;
 	for (size_t q = s0; q < s1; q++) {
-		const tessera::Triple &t = cells[stride > 1 ? stride * q : wide ? 2 * q : q];
+		const tessera::Triple &t = cells[wide ? 2 * q : q];
 		const bool sw = !info.symmetric && side[t.i] != 0;
 		for (int o = 0; o < (info.symmetric && t.i != t.j ? 2 : 1); o++) {
 			const bool flip = sw != (o == 1);
@@ -1219,9 +1128,9 @@ static idx_t EmitCrossGeneral(ClientContext &ctx, const tessera::Triple *cells, 
 		}
 #undef TESSERA_WRITE
 	}
-	auto write_values = [&](Vector &sv, const __int128 *values, bool values_general) {
+	auto write_sums = [&](Vector &sv) {
 		for (idx_t r = 0; r < row; r++) {
-			const __int128 v = values[qs[r]];
+			const __int128 v = sums[qs[r]];
 			switch (sv.GetType().InternalType()) {
 			case PhysicalType::INT64:
 				FlatVector::GetDataMutable<int64_t>(sv)[r] = (int64_t)v;
@@ -1231,7 +1140,7 @@ static idx_t EmitCrossGeneral(ClientContext &ctx, const tessera::Triple *cells, 
 				break;
 			default: {
 				double d;
-				if (values_general) {
+				if (general2) {
 					const uint64_t bits = (uint64_t)v;
 					memcpy(&d, &bits, sizeof d);
 				} else {
@@ -1242,35 +1151,9 @@ static idx_t EmitCrossGeneral(ClientContext &ctx, const tessera::Triple *cells, 
 			}
 		}
 	};
-	auto write_sums = [&](Vector &sv) {
-		write_values(sv, sums, general2);
-	};
 	if (!info.aggs.empty()) {
 		for (idx_t i = 0; i < info.aggs.size(); i++) {
 			Vector &out = chunk.data[info.out_groups.size() + i];
-			if (info.aggs[i] >= 3) {
-				const auto &m = many[info.aggs[i] - 3];
-				for (idx_t r = 0; r < row; r++) {
-					const tessera::Triple *t = cells + stride * qs[r] + m.at;
-					switch (out.GetType().InternalType()) {
-					case PhysicalType::INT64:
-						FlatVector::GetDataMutable<int64_t>(out)[r] = (int64_t)t[0].s;
-						break;
-					case PhysicalType::INT128:
-						FlatVector::GetDataMutable<hugeint_t>(out)[r] = hugeint_t((int64_t)t[1].s, t[0].s);
-						break;
-					default:
-						memcpy(&FlatVector::GetDataMutable<double>(out)[r], &t[0].s, sizeof(double));
-					}
-				}
-				continue;
-			}
-			if (stride > 1) {
-				for (idx_t r = 0; r < row; r++) {
-					FlatVector::GetDataMutable<int64_t>(out)[r] = (int64_t)cells[stride * qs[r]].s;
-				}
-				continue;
-			}
 			if (info.aggs[i] == 1) {
 				write_sums(out);
 				continue;
@@ -1325,16 +1208,14 @@ SourceResultType PhysicalTessera::GetDataInternal(ExecutionContext &context, Dat
 		return SourceResultType::FINISHED;
 	}
 	auto &cells = g.out[src.blocks[b].first];
-	size_t s0 = src.blocks[b].second,
-	       s1 = std::min(g.stride > 1 ? cells.n / g.stride : tessera::cell_count(cells, g.wide), s0 + TesseraGlobalSource::BLOCK);
+	size_t s0 = src.blocks[b].second, s1 = std::min(tessera::cell_count(cells, g.wide), s0 + TesseraGlobalSource::BLOCK);
 	const tessera::Triple *c = cells.data.get();
 	const int64_t *orig = g.orig.data();
 	idx_t row;
 	if (info.cross) {
 		row = info.general_cross
 		          ? EmitCrossGeneral(context.client, c, s0, s1, orig, g.side.data(), info, g.general, g.wide, g.xd, g.yd, chunk,
-		                             info.two && info.sums.empty() ? g.out2[src.blocks[b].first].data() : nullptr, g.general2,
-		                             g.sums, g.stride)
+		                             info.two ? g.out2[src.blocks[b].first].data() : nullptr, g.general2)
 		          : EmitCross(context.client, c, s0, s1, orig, g.side.data(), info, g.general, g.wide, g.xd, g.yd, chunk);
 		chunk.SetChildCardinality(row);
 		return SourceResultType::HAVE_MORE_OUTPUT;

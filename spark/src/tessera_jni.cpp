@@ -248,47 +248,6 @@ JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setDistinctKeys(JNIEnv *
   tessera_c_set_distinct_keys((tessera_query_c *)h, on ? 1 : 0);
 }
 
-JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setGroupTop(JNIEnv *, jclass, jlong h, jlong k, jint of) {
-  tessera_c_set_group_top((tessera_query_c *)h, k, of);
-}
-
-JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setSumLimit(JNIEnv *, jclass, jlong h, jdouble limit) {
-  tessera_c_set_sum_limit((tessera_query_c *)h, limit);
-}
-
-JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_setMany(JNIEnv *, jclass, jlong h, jint n, jint pair_op) {
-  tessera_c_set_many((tessera_query_c *)h, (size_t)n, pair_op);
-}
-
-JNIEXPORT jint JNICALL Java_tessera_spark_TesseraNative_addMany(JNIEnv *env, jclass, jlong h, jboolean second, jlongArray k,
-                                                                jlongArray x, jdoubleArray v, jint n) {
-  int rc = -1;
-  {
-    Pinned p(env);
-    jlong *a = (jlong *)p.pin(k, 0), *b = (jlong *)p.pin(x, 0);
-    jdouble *d = (jdouble *)p.pin(v, 0);
-    if (p.ok()) {
-      rc = tessera_c_add_many((tessera_query_c *)h, second ? 1 : 0, (int64_t *)a, (int64_t *)b, (double *)d, (size_t)n);
-    }
-  }
-  return rc;
-}
-
-JNIEXPORT jint JNICALL Java_tessera_spark_TesseraNative_nextMany(JNIEnv *env, jclass, jlong h, jlongArray x0, jlongArray x1,
-                                                                 jlongArray cnt, jdoubleArray v) {
-  const jsize cap = env->GetArrayLength(x0);
-  size_t n = 0;
-  {
-    Pinned p(env);
-    jlong *a = (jlong *)p.pin(x0, 0), *b = (jlong *)p.pin(x1, 0), *c = (jlong *)p.pin(cnt, 0);
-    jdouble *d = (jdouble *)p.pin(v, 0);
-    if (p.ok()) {
-      n = tessera_c_next_many((tessera_query_c *)h, (int64_t *)a, (int64_t *)b, (int64_t *)c, (double *)d, (size_t)cap);
-    }
-  }
-  return (jint)n;
-}
-
 JNIEXPORT void JNICALL Java_tessera_spark_TesseraNative_cancel(JNIEnv *, jclass, jlong h) {
   tessera_c_cancel((tessera_query_c *)h);
 }
