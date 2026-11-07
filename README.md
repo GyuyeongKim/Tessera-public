@@ -225,11 +225,11 @@ These run as the engine's own plan, with the same result:
 - in PostgreSQL and Spark, `SUM` of `real` / `float` products, which those engines sum in float32.
 
 NULLs: group columns may hold NULLs. A summed column must hold none: an adapter leaves a query to the engine unless it
-knows that the column holds none. DuckDB checks the column statistics, PostgreSQL needs a valid `NOT NULL` constraint,
-and Spark needs a non-nullable column or an `IS NOT NULL` filter. The SQLite table functions take NULL group keys in
-mode `'full'` and in `tessera_xty`, leave their rows out with a pair filter, and return an error on a NULL value. A
-DuckDB statement prepared while its summed columns held no NULLs returns an error that asks to prepare it again if
-NULLs arrive later.
+knows that the column holds none. DuckDB checks the column statistics, which tables and Parquet files have and pandas
+DataFrames and CSV files do not. PostgreSQL needs a valid `NOT NULL` constraint, and Spark needs a non-nullable column
+or an `IS NOT NULL` filter. The SQLite table functions take NULL group keys in mode `'full'` and in `tessera_xty`, leave
+their rows out with a pair filter, and return an error on a NULL value. A DuckDB statement prepared while its summed
+columns held no NULLs returns an error that asks to prepare it again if NULLs arrive later.
 
 Operators: PostgreSQL's adapter recognizes only PostgreSQL's own operators and aggregates, so a user's `*` earlier on
 the search path keeps the engine's plan. A group or key computed from a column must be an expression that cannot raise
@@ -286,13 +286,14 @@ on macOS in a process without such a library.
 Tessera uses DuckDB's `threads`, and output beyond `memory_limit` goes to `temp_directory` within
 `max_temp_directory_size`.
 
-A pandas DataFrame or a Parquet or CSV file has no distinct counts, so the planner reads about 262,144 rows of each input
-and counts the joined rows itself. It reads a little of every row group of a local Parquet file and of every part of a
-DataFrame, so a file sorted by another column is measured like any other. It reads from the start where it cannot skip
-ahead: CSV files, remote files, a Parquet file with three quarters of its rows in one row group, inputs with a pushed
-filter, and several files without `parquet_metadata_cache`; a join that looks small there stays with DuckDB, with the
-same result. Arrow readers are read once only, so Arrow tables and Polars frames stay with DuckDB unless
-`tessera_min_expansion_cross` is set to `0`.
+A pandas DataFrame or a Parquet or CSV file has no distinct counts, so the planner reads about 262,144 rows of each
+input and counts the joined rows itself. It reads a little of every row group of a local Parquet file and of every part
+of a DataFrame, so a file sorted by another column is measured like any other. It reads from the start where it cannot
+skip ahead: CSV files, remote files, a Parquet file with three quarters of its rows in one row group, inputs with a
+pushed filter, and several files without `parquet_metadata_cache`; a join that looks small there stays with DuckDB, with
+the same result. A sum over a DataFrame or a CSV file also stays with DuckDB, since neither has the statistics that show
+that its summed column holds no NULLs (see [Supported queries](#supported-queries)). Arrow readers are read once only,
+so Arrow tables and Polars frames stay with DuckDB unless `tessera_min_expansion_cross` is set to `0`.
 
 ```sql
 SELECT * FROM tessera_sim('t', 'k', 'x', 'jaccard', 0.5);
