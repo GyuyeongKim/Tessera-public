@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tessera in Your Browser</title>
 <meta name="description" content="DuckDB and Tessera run the same join-aggregate SQL on New York Times articles, in your browser.">
-<link rel="stylesheet" href="app.css?v=97b1038381">
+<link rel="stylesheet" href="app.css?v=1e7a1423a0">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 fill=%22%230062cc%22/%3E%3Crect x=%222%22 y=%222%22 width=%225%22 height=%225%22 fill=%22%23ffffff%22/%3E%3C/svg%3E">
 <script>
 try { const t = localStorage.getItem('theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
@@ -56,13 +56,17 @@ if (new URLSearchParams(location.search).get('lang') === 'ko') document.document
       <h2>DuckDB <span class="ver" id="duckver"></span></h2>
       <p class="how" data-i18n="duck.how">Its own plan: a hash join that builds a row for every two words in an article, then a hash aggregation.</p>
       <p class="time" id="ducktime">&ndash;</p>
+      <div class="tbar" id="duckbar" aria-hidden="true"></div>
       <p class="state" id="duckstate">Waiting</p>
+      <div class="flow" id="duckflow" aria-live="off"></div>
     </div>
     <div class="lane tess">
       <h2>Tessera <span class="ver" id="tessver"></span></h2>
       <p class="how" data-i18n="tess.how">A sparse product that adds each article's pairs into counters and drops, before counting, the words that cannot qualify.</p>
       <p class="time" id="tesstime">&ndash;</p>
+      <div class="tbar" id="tessbar" aria-hidden="true"></div>
       <p class="state" id="tessstate">Waiting</p>
+      <div class="flow" id="tessflow" aria-live="off"></div>
     </div>
   </section>
 
@@ -119,11 +123,11 @@ if (new URLSearchParams(location.search).get('lang') === 'ko') document.document
     <p data-i18n-html="foot.data">Data: the NYTimes collection of <a href="https://archive.ics.uci.edu/dataset/164/bag+of+words">Bag of Words</a>,
     UCI Machine Learning Repository, D. Newman (CC BY 4.0), 10,000 of its 300,000 articles chosen at random. Words are
     stored as numbers and shown as text. DuckDB-WASM <span id="duckwasm">1.32.0</span> loads from jsDelivr, and Tessera
-    <span id="tessfoot">1.3.0</span> is compiled with Emscripten for one thread. Queries run in this page and send nothing
+    <span id="tessfoot">1.4.1</span> is compiled with Emscripten for one thread. Queries run in this page and send nothing
     anywhere.</p>
     <p><a href="https://github.com/GyuyeongKim/Tessera-public" data-i18n="foot.github">Tessera on GitHub</a></p>
   </footer>
 </main>
-<script type="module" src="app.js?v=223e625bd6"></script>
+<script type="module" src="app.js?v=adb2336a82"></script>
 </body>
 </html>

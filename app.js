@@ -1,13 +1,14 @@
-import { decode } from './dataset.js?v=afa3a41209';
-import { openDuck, loadBase, useArticles, runDuck } from './duck_run.js?v=5cd050b38b';
-import { dict } from './i18n.js?v=e3e654839b';
+import { decode, PAIRS } from './dataset.js?v=6516010bf0';
+import { openDuck, loadBase, useArticles, runDuck, explainDuck } from './duck_run.js?v=af33c9f9db';
+import { createFlows } from './flow.js?v=e3bea3bf6a';
+import { dict } from './i18n.js?v=f6a3917959';
 
 const SIZES = [1000, 2000, 5000, 10000];
 const fmt = new Intl.NumberFormat('en-US');
 const $ = (id) => document.getElementById(id);
 const state = { articles: 2000, query: 'top', pct: 2, busy: true };
 let words = [], stats = {}, duck = null, duckArticles = 0, tess = null, nextId = 1;
-let lang = document.documentElement.lang === 'ko' ? 'ko' : 'en', dark = false, tessVersion = null;
+let lang = document.documentElement.lang === 'ko' ? 'ko' : 'en', dark = false, tessVersion = null, flows = null, planToken = 0, ran = false;
 const live = new Map();
 
 function t(key, vars = {}) {
@@ -57,7 +58,7 @@ function renderControls() {
     b.setAttribute('role', 'radio');
     b.setAttribute('aria-checked', String(n === state.articles));
     b.disabled = state.busy;
-    b.onclick = () => { state.articles = n; renderControls(); };
+    b.onclick = () => { state.articles = n; changed(); };
     return b;
   }));
   const s = stats[state.articles];
@@ -74,10 +75,16 @@ function lane(which, time, key, vars, bad) {
   $(`${which}state`).classList.toggle('bad', !!bad);
 }
 
-function ticker(which) {
+function ticker(which, onTick = () => {}) {
   const t0 = performance.now();
   let on = true;
-  const step = () => { if (!on) return; $(`${which}time`).textContent = seconds(performance.now() - t0); requestAnimationFrame(step); };
+  const step = () => {
+    if (!on) return;
+    const x = performance.now() - t0;
+    $(`${which}time`).textContent = seconds(x);
+    onTick(x);
+    requestAnimationFrame(step);
+  };
   requestAnimationFrame(step);
   return () => { on = false; };
 }
@@ -87,6 +94,7 @@ function runTess(articles, opts) {
     const id = nextId++;
     const on = (e) => {
       if (e.data.id !== id) return;
+      if (e.data.type === 'phase') { flows.tessPhase(e.data.name, e.data.ms, e.data.info); return; }
       tess.removeEventListener('message', on);
       resolve(e.data);
     };
@@ -116,6 +124,30 @@ function showRows(top, key, vars) {
   $('result').hidden = false;
 }
 
+function context() {
+  const s = stats[state.articles] || {};
+  return { query: state.query, articles: state.articles, rows: s.rows, joined: s.joined, groups: PAIRS[state.articles] };
+}
+
+async function refreshPlan() {
+  if (!duck || !flows) return;
+  const my = ++planToken;
+  try {
+    const plan = await explainDuck(duck, sql());
+    if (my === planToken) flows.setPlan(plan);
+  } catch (e) {
+    if (my === planToken) flows.setPlan(null);
+  }
+}
+
+function changed() {
+  renderControls();
+  if (!flows || state.busy || ran) return;
+  flows.reset();
+  flows.setContext(context());
+  refreshPlan();
+}
+
 async function run() {
   state.busy = true;
   renderControls();
@@ -129,16 +161,26 @@ async function run() {
     await useArticles(duck, articles);
     duckArticles = articles;
   }
+  flows.reset();
+  flows.setContext(context());
+  await refreshPlan();
   say('status', 'status.running');
-  let stop = ticker('tess');
+  flows.tessStart();
+  let stop = ticker('tess', (x) => flows.tessTick(x));
   const r = await runTess(articles, tessOpts());
   stop();
+  flows.tessDone(r);
+  if (query === 'having' && r.type !== 'error') flows.setFiltered(r.cells);
   if (r.type === 'error') lane('tess', '–', 'raw', { s: r.message }, true);
   else lane('tess', seconds(r.ms), 'lane.done');
   lane('duck', '0.000\u00a0s', 'lane.running');
-  stop = ticker('duck');
+  flows.duckStart();
+  stop = ticker('duck', (x) => flows.duckTick(x));
   const d = await runDuck(duck, text);
   stop();
+  flows.duckDone(d.ms, !d.error);
+  if (query === 'having' && !d.error) flows.setFiltered(Number(d.rows[0]?.pairs ?? 0));
+  ran = true;
   const oom = d.error && /out of memory/i.test(d.error);
   if (d.error) lane('duck', seconds(d.ms), oom ? 'lane.oom' : 'raw', { s: d.error }, true);
   else lane('duck', seconds(d.ms), 'lane.done');
@@ -189,6 +231,7 @@ function applyLang() {
   $('theme').textContent = t(dark ? 'theme.light' : 'theme.dark');
   for (const [id, { key, vars, html }] of live) say(id, key, vars, html);
   if (tessVersion) $('tessfoot').textContent = tessVersion;
+  if (flows) flows.draw();
   renderControls();
 }
 
@@ -216,12 +259,13 @@ async function main() {
   $('theme').onclick = () => setTheme(dark ? 'light' : 'dark');
   $('lang').onclick = () => setLang(lang === 'ko' ? 'en' : 'ko');
   $('copybib').onclick = copyBib;
+  flows = createFlows({ duckEl: $('duckflow'), tessEl: $('tessflow'), duckBar: $('duckbar'), tessBar: $('tessbar'), t, fmt });
   say('status', 'status.loading');
   lane('duck', '–', 'lane.waiting');
   lane('tess', '–', 'lane.waiting');
   applyLang();
-  for (const r of document.querySelectorAll('input[name=q]')) r.onchange = () => { state.query = r.value; renderControls(); };
-  $('pct').onchange = (e) => { state.pct = Number(e.target.value); renderControls(); };
+  for (const r of document.querySelectorAll('input[name=q]')) r.onchange = () => { state.query = r.value; changed(); };
+  $('pct').onchange = (e) => { state.pct = Number(e.target.value); changed(); };
   $('run').onclick = run;
   try {
     const bytes = await gunzip('data/nytimes.bin.gz?v=6a6ecf908e');
@@ -235,7 +279,8 @@ async function main() {
       stats[n] = { rows, joined };
     }
     renderControls();
-    tess = new Worker('tessera_worker.js?v=e6660d2cae', { type: 'module' });
+    flows.setContext(context());
+    tess = new Worker('tessera_worker.js?v=1d8bf08c54', { type: 'module' });
     const ready = new Promise(res => tess.addEventListener('message', e => { if (e.data.type === 'ready') res(e.data); }, { once: true }));
     tess.postMessage({ type: 'init', bytes: bytes.slice() });
     say('status', 'status.duck');
@@ -243,6 +288,9 @@ async function main() {
     $('duckver').textContent = duck.version.replace(/^v/, '') + ' (WASM)';
     say('status', 'status.base');
     await loadBase(duck, all);
+    await useArticles(duck, state.articles);
+    duckArticles = state.articles;
+    await refreshPlan();
     const r = await ready;
     tessVersion = r.version;
     $('tessver').textContent = `${r.version} (WASM)`;

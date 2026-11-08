@@ -32,3 +32,8 @@ export async function runDuck(duck, sql) {
     return { ms: performance.now() - t0, error: String(err && err.message || err) };
   }
 }
+
+export async function explainDuck(duck, sql) {
+  const r = (await duck.conn.query(`EXPLAIN (FORMAT JSON) ${sql}`)).toArray().map(r => r.toJSON());
+  return JSON.parse(r[0].explain_value)[0];
+}

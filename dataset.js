@@ -19,3 +19,6 @@ export function decode(bytes, articles) {
   }
   return { articles: n, words, rows: r, k: k.subarray(0, r), x: x.subarray(0, r) };
 }
+
+// Distinct word pairs (groups of the join-aggregate) among the first n articles, from tools/pair_counts.mjs.
+export const PAIRS = { 1000: 18883958, 2000: 32416480, 5000: 64684370, 10000: 101390683 };
