@@ -2,7 +2,7 @@ package tessera.spark
 
 import java.io.ByteArrayOutputStream
 
-import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.{ArrayBuffer, ArrayBuilder}
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSessionExtensions
@@ -1075,15 +1075,16 @@ object TesseraCross extends PredicateHelper {
     val gBytes = !(gIdx.size == 1 && heldAsLong(gTypes.head)) || gNull.contains(true)
     val gTuple = gIdx.size > 1 || gNull.contains(true)
     plan.execute().mapPartitions { it =>
-      val k = new ArrayBuffer[Long](); val x = new ArrayBuffer[Long](); val v = new ArrayBuffer[Double]()
-      val iv = new ArrayBuffer[Long]()
-      val mv = new ArrayBuffer[Double]()
-      val mn = new ArrayBuffer[Long]()
+      val k = new ArrayBuilder.ofLong; val x = new ArrayBuilder.ofLong; val v = new ArrayBuilder.ofDouble
+      val iv = new ArrayBuilder.ofLong
+      val mv = new ArrayBuilder.ofDouble
+      val mn = new ArrayBuilder.ofLong
       val manyInt = manyIsInt.contains(true)
-      val mi = new ArrayBuffer[Long]()
+      val mi = new ArrayBuilder.ofLong
       val kb = new ByteArrayOutputStream(); val xb = new ByteArrayOutputStream()
-      val ko = ArrayBuffer[Int](0); val xo = ArrayBuffer[Int](0)
-      def bytes(r: InternalRow, idx: Seq[Int], types: Seq[DataType], b: ByteArrayOutputStream, o: ArrayBuffer[Int],
+      val ko = new ArrayBuilder.ofInt; val xo = new ArrayBuilder.ofInt
+      ko += 0; xo += 0
+      def bytes(r: InternalRow, idx: Seq[Int], types: Seq[DataType], b: ByteArrayOutputStream, o: ArrayBuilder.ofInt,
                 tuple: Boolean, nulls: Seq[Boolean]): Unit = {
         if (!tuple) {
           val u = bytesOf(r, idx.head, types.head)
@@ -1127,11 +1128,11 @@ object TesseraCross extends PredicateHelper {
           n += 1
         }
       }
-      Iterator(TesseraPart(n, if (kBytes) null else k.toArray, if (kBytes) kb.toByteArray else null,
-        if (kBytes) ko.toArray else null, if (gBytes) null else x.toArray, if (gBytes) xb.toByteArray else null,
-        if (gBytes) xo.toArray else null, if (hasValue && !vInt) v.toArray else null,
-        if (hasValue && vInt) iv.toArray else null, if (many.nonEmpty) mv.toArray else null,
-        if (manyNull) mn.toArray else null, if (manyInt) mi.toArray else null))
+      Iterator(TesseraPart(n, if (kBytes) null else k.result(), if (kBytes) kb.toByteArray else null,
+        if (kBytes) ko.result() else null, if (gBytes) null else x.result(), if (gBytes) xb.toByteArray else null,
+        if (gBytes) xo.result() else null, if (hasValue && !vInt) v.result() else null,
+        if (hasValue && vInt) iv.result() else null, if (many.nonEmpty) mv.result() else null,
+        if (manyNull) mn.result() else null, if (manyInt) mi.result() else null))
     }.collect()
   }
 }
@@ -1356,16 +1357,24 @@ case class TesseraExec(output: Seq[Attribute], spec: TesseraSpec, child: SparkPl
     val s = spec
     val kStr = s.kType == StringType
     val xStr = s.xType == StringType
+    val verbose = SQLConf.get.getConfString("spark.tessera.verbose", "false").toBoolean
+    var t0 = System.nanoTime()
+    def phase(name: String): Unit = if (verbose) {
+      val t1 = System.nanoTime()
+      System.err.println(f"tessera: self form: $name ${(t1 - t0) / 1e9}%.3f s")
+      t0 = t1
+    }
     val parts = child.execute().mapPartitions { it =>
-      val k = new ArrayBuffer[Long](); val x = new ArrayBuffer[Long](); val v = new ArrayBuffer[Double]()
-      val iv = new ArrayBuffer[Long]()
+      val k = new ArrayBuilder.ofLong; val x = new ArrayBuilder.ofLong; val v = new ArrayBuilder.ofDouble
+      val iv = new ArrayBuilder.ofLong
       val kb = new ByteArrayOutputStream(); val xb = new ByteArrayOutputStream()
-      val ko = ArrayBuffer[Int](0); val xo = ArrayBuffer[Int](0)
+      val ko = new ArrayBuilder.ofInt; val xo = new ArrayBuilder.ofInt
+      ko += 0; xo += 0
       def int(r: InternalRow, i: Int, t: DataType): Long = t match {
         case LongType | TimestampType | TimestampNTZType => r.getLong(i); case ShortType => r.getShort(i).toLong
         case _ => r.getInt(i).toLong
       }
-      def str(r: InternalRow, i: Int, b: ByteArrayOutputStream, o: ArrayBuffer[Int]): Unit = {
+      def str(r: InternalRow, i: Int, b: ByteArrayOutputStream, o: ArrayBuilder.ofInt): Unit = {
         val u = r.getUTF8String(i).getBytes
         b.write(u, 0, u.length)
         o += b.size()
@@ -1385,15 +1394,15 @@ case class TesseraExec(output: Seq[Attribute], spec: TesseraSpec, child: SparkPl
           n += 1
         }
       }
-      Iterator(TesseraPart(n, if (kStr) null else k.toArray, if (kStr) kb.toByteArray else null,
-        if (kStr) ko.toArray else null, if (xStr) null else x.toArray, if (xStr) xb.toByteArray else null,
-        if (xStr) xo.toArray else null, if (s.vIdx >= 0 && !s.vInt) v.toArray else null,
-        if (s.vIdx >= 0 && s.vInt) iv.toArray else null))
+      Iterator(TesseraPart(n, if (kStr) null else k.result(), if (kStr) kb.toByteArray else null,
+        if (kStr) ko.result() else null, if (xStr) null else x.result(), if (xStr) xb.toByteArray else null,
+        if (xStr) xo.result() else null, if (s.vIdx >= 0 && !s.vInt) v.result() else null,
+        if (s.vIdx >= 0 && s.vInt) iv.result() else null))
     }.collect()
+    phase(s"collect (${parts.map(_.n.toLong).sum} rows)")
     val c = SQLConf.get
     val threads = TesseraConf.threads(c)
     val alive = org.apache.spark.sql.tessera.TesseraStatement.alive(sparkContext)
-    val verbose = c.getConfString("spark.tessera.verbose", "false").toBoolean
     val h = TesseraRun.handle(TesseraNative.create(s.vIdx >= 0), "query handle")
     var dk, dx = 0L
     try {
@@ -1410,12 +1419,14 @@ case class TesseraExec(output: Seq[Attribute], spec: TesseraSpec, child: SparkPl
         if ((if (s.vInt) TesseraNative.addI64(h, k, x, p.iv, p.n) else TesseraNative.add(h, k, x, p.v, p.n)) != 0)
           throw new IllegalStateException("tessera: out of memory (rows)")
       }
+      phase("code and add")
       if (xStr) TesseraNative.setXDict(h, dx)
       if (s.simMeasure > 0) TesseraNative.setSimilarity(h, s.simMeasure, s.minSim)
       if (s.distinctKeys) TesseraNative.setDistinctKeys(h, true)
       if (s.groupTopk > 0) TesseraNative.setGroupTop(h, s.groupTopk, s.groupOf)
       if (s.vInt) TesseraNative.setSumLimit(h, math.pow(2.0, 63))
       TesseraRun.run(h, alive, TesseraNative.run(h, s.mode, s.col0Smaller, s.minValue, s.topk, threads, -1L, verbose))
+      phase("run")
       if (s.vInt && s.ansi) TesseraEvalModes.check(h, s.vType)
       val general = TesseraNative.general(h)
       val xDict = if (xStr) sparkContext.broadcast((TesseraNative.xStringBytes(h), TesseraNative.xStringOffsets(h)))
@@ -1431,6 +1442,7 @@ case class TesseraExec(output: Seq[Attribute], spec: TesseraSpec, child: SparkPl
         if (n > 0) chunks += ((a, b, vi, vd, n))
         done = n < a.length
       }
+      phase(s"fetch (${chunks.map(_._5.toLong).sum} rows in ${chunks.size} chunks)")
       val types = output.map(_.dataType).toArray
       sparkContext.parallelize(chunks.toSeq, math.max(1, chunks.size)).mapPartitions { it =>
         val proj = UnsafeProjection.create(types)

@@ -1851,7 +1851,11 @@ static void tessera_upper_hook(PlannerInfo *root, UpperRelationKind stage, RelOp
 	cp->path.parallel_aware = false;
 	cp->path.parallel_safe = false;
 	cp->path.parallel_workers = 0;
-	cp->path.rows = output_rel->rows > 0 ? output_rel->rows : 1;
+	double rows = output_rel->rows;
+	if (rows <= 0 && output_rel->pathlist != NIL) {
+		rows = ((Path *)linitial(output_rel->pathlist))->rows;
+	}
+	cp->path.rows = rows > 0 ? rows : 1;
 	cp->path.startup_cost = 0;
 	cp->path.total_cost = 1;
 	cp->path.pathkeys = NIL;

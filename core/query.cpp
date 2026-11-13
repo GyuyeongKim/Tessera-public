@@ -13,6 +13,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <set>
@@ -264,6 +265,12 @@ static void ParSort(vector<V> &a, int T) {
 }
 
 static const int64_t POLL_EVERY = 1 << 16;
+static const size_t PIECE_ROWS = 1 << 20;
+static size_t piece_rows() {
+	const char *e = getenv("TESSERA_PIECE_ROWS");
+	const long long v = e ? atoll(e) : 0;
+	return v > 0 ? (size_t)v : PIECE_ROWS;
+}
 
 static const double RANGE_PER_DISTINCT = 4;
 static const int32_t TOPK_FIRST = 256;
@@ -509,6 +516,39 @@ static Csr PermuteItems(const Csr &X, const vector<int32_t> &lay, int T) {
 }
 
 static std::atomic<int> active_teams {0};
+
+#ifdef __linux__
+__attribute__((constructor)) static void unbind_loading_thread() {
+	if (omp_get_proc_bind() == omp_proc_bind_false) {
+		return;
+	}
+	const int places = omp_get_num_places();
+	cpu_set_t cur, first, all;
+	if (places < 2 || sched_getaffinity(0, sizeof cur, &cur) != 0) {
+		return;
+	}
+	CPU_ZERO(&first);
+	CPU_ZERO(&all);
+	vector<int> ids;
+	for (int p = 0; p < places; p++) {
+		ids.assign((size_t)std::max(omp_get_place_num_procs(p), 0), -1);
+		if (!ids.empty()) {
+			omp_get_place_proc_ids(p, ids.data());
+		}
+		for (const int c : ids) {
+			if (c >= 0 && c < CPU_SETSIZE) {
+				CPU_SET(c, &all);
+				if (p == 0) {
+					CPU_SET(c, &first);
+				}
+			}
+		}
+	}
+	if (CPU_EQUAL(&cur, &first)) {
+		sched_setaffinity(0, sizeof all, &all);
+	}
+}
+#endif
 static bool pause_frees_own_pool() {
 	static const bool gomp = [] {
 		Dl_info d;
@@ -521,6 +561,7 @@ struct Team {
 	int saved;
 	bool release;
 	bool pinned = false;
+	bool restore = false;
 #ifdef __linux__
 	cpu_set_t caller_mask;
 #endif
@@ -542,6 +583,8 @@ struct Team {
 				}
 			}
 			pinned = cpus.size() > 1;
+		} else if (env_bind) {
+			restore = sched_getaffinity(0, sizeof caller_mask, &caller_mask) == 0;
 		}
 #else
 		(void)alone;
@@ -566,7 +609,7 @@ struct Team {
 	~Team() {
 		omp_set_num_threads(saved);
 #ifdef __linux__
-		if (pinned) {
+		if (pinned || restore) {
 			pthread_setaffinity_np(pthread_self(), sizeof caller_mask, &caller_mask);
 		}
 #endif
@@ -1433,27 +1476,39 @@ static void RunQuery(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector
 	}
 	qr.int_values = int_in;
 	qr.prod_min = qr.prod_max = qr.cell_min = qr.cell_max = 0;
+	struct Piece {
+		int p;
+		size_t lo, hi;
+	};
+	vector<Piece> pieces;
+	const size_t piece = piece_rows();
+	for (int p = 0; p < P; p++) {
+		const size_t m = parts[p]->k.size();
+		for (size_t lo = 0; lo < m; lo += piece) {
+			pieces.push_back({p, lo, std::min(m, lo + piece)});
+		}
+	}
+	const int64_t NP = (int64_t)pieces.size();
 	qr.wide = false;
 	qr.general = false;
 	bool ones = true;
 #pragma omp parallel for num_threads(T) schedule(dynamic, 1) reduction(min : minx, mink) reduction(max : maxx, maxk) \
     reduction(&& : ones)
-	for (int p = 0; p < P; p++) {
-		for (auto x : parts[p]->x) {
-			minx = std::min(minx, x);
-			maxx = std::max(maxx, x);
-		}
-		for (auto k : parts[p]->k) {
-			mink = std::min(mink, k);
-			maxk = std::max(maxk, k);
+	for (int64_t q = 0; q < NP; q++) {
+		const QueryPart &pt = *parts[pieces[q].p];
+		for (size_t e = pieces[q].lo; e < pieces[q].hi; e++) {
+			minx = std::min(minx, pt.x[e]);
+			maxx = std::max(maxx, pt.x[e]);
+			mink = std::min(mink, pt.k[e]);
+			maxk = std::max(maxk, pt.k[e]);
 		}
 		if (has_value && int_in) {
-			for (auto v : parts[p]->iv) {
-				ones = ones && v == 1;
+			for (size_t e = pieces[q].lo; e < pieces[q].hi; e++) {
+				ones = ones && pt.iv[e] == 1;
 			}
 		} else if (has_value) {
-			for (auto v : parts[p]->v) {
-				ones = ones && v == 1;
+			for (size_t e = pieces[q].lo; e < pieces[q].hi; e++) {
+				ones = ones && pt.v[e] == 1;
 			}
 		}
 	}
@@ -1511,9 +1566,9 @@ static void RunQuery(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector
 			cnt[i].store(0, std::memory_order_relaxed);
 		}
 #pragma omp parallel for num_threads(T) schedule(dynamic, 1)
-		for (int p = 0; p < P; p++) {
-			const auto &px = parts[p]->x;
-			for (size_t e = 0; e < px.size() && !poll((int64_t)e); e++) {
+		for (int64_t q = 0; q < NP; q++) {
+			const auto &px = parts[pieces[q].p]->x;
+			for (size_t e = pieces[q].lo; e < pieces[q].hi && !poll((int64_t)e); e++) {
 				cnt[px[e] - minx].fetch_add(1, std::memory_order_relaxed);
 			}
 		}
@@ -1593,9 +1648,9 @@ static void RunQuery(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector
 			rc[i].store(0, std::memory_order_relaxed);
 		}
 #pragma omp parallel for num_threads(T) schedule(dynamic, 1)
-		for (int p = 0; p < P; p++) {
-			const auto &pk = parts[p]->k;
-			for (size_t e = 0; e < pk.size() && !poll((int64_t)e); e++) {
+		for (int64_t q = 0; q < NP; q++) {
+			const auto &pk = parts[pieces[q].p]->k;
+			for (size_t e = pieces[q].lo; e < pieces[q].hi && !poll((int64_t)e); e++) {
 				rc[pk[e] - mink].fetch_add(1, std::memory_order_relaxed);
 			}
 		}
@@ -1616,11 +1671,12 @@ static void RunQuery(std::vector<std::unique_ptr<QueryPart>> &parts, std::vector
 		vector<double> val(has_v && !has_iv ? n : 0);
 		vector<int64_t> ival(has_iv ? n : 0);
 #pragma omp parallel for num_threads(T) schedule(dynamic, 1)
-		for (int p = 0; p < P; p++) {
+		for (int64_t q = 0; q < NP; q++) {
+			const int p = pieces[q].p;
 			auto &pk = parts[p]->k, &px = parts[p]->x;
 			auto &pv = parts[p]->v;
 			auto &piv = parts[p]->iv;
-			for (size_t e = 0; e < pk.size() && !poll((int64_t)e); e++) {
+			for (size_t e = pieces[q].lo; e < pieces[q].hi && !poll((int64_t)e); e++) {
 				int64_t o = pos[pk[e] - mink].fetch_add(1, std::memory_order_relaxed);
 				idx[o] = rank_of[px[e] - minx];
 				if (has_iv) {
