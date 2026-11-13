@@ -41,6 +41,11 @@ endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+if(TESSERA_OWN)
+  set(TESSERA_LAUNCH ${CMAKE_COMMAND} -E env NM=${CMAKE_NM} OBJCOPY=${CMAKE_OBJCOPY} sh ${T}/own_cc.sh
+      ${CMAKE_CXX_COMPILER_LAUNCHER})
+  set_target_properties(${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME} PROPERTIES CXX_COMPILER_LAUNCHER "${TESSERA_LAUNCH}")
+endif()
 target_link_libraries(${EXTENSION_NAME} OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
 set(TESSERA_OMP_STATIC "")
 if(OpenMP_libomp_LIBRARY)

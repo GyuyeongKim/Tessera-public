@@ -13,7 +13,7 @@
 
 ## News
 
-- **[2026/11]** Tessera 1.4.3 fixes four problems. Three showed in 1.4.1 with queries derived from TPC-H, TPC-DS, and
+- **[2026/11]** Tessera 1.4.4 fixes four problems. Three showed in 1.4.1 with queries derived from TPC-H, TPC-DS, and
   TPCx-BB, the Join Order Benchmark, and LDBC SNB: with `OMP_PROC_BIND` or `GOMP_CPU_AFFINITY` set, loading Tessera no
   longer leaves DuckDB on one CPU; PostgreSQL plans what runs above Tessera on its own estimate of the groups instead
   of one row; and Spark builds Tessera's matrix with all its threads, which halves the time of a pair count derived
@@ -113,7 +113,7 @@ linear algebra (54.3 s against 2.9 s on the news articles). Release 1.1.1 reruns
 |---|---|---|
 | SQLite in Python | [`sqlite-tessera`](https://pypi.org/project/sqlite-tessera/) on PyPI | `pip install sqlite-tessera` |
 | SQLite | `tessera-sqlite-<version>-<platform>.tar.gz` on the [releases page](https://github.com/GyuyeongKim/Tessera-public/releases) | `.load ./tessera` in the shell |
-| Spark | `io.github.gyuyeongkim:tessera-spark_2.13` on Maven Central | `--packages io.github.gyuyeongkim:tessera-spark_2.13:1.4.3` |
+| Spark | `io.github.gyuyeongkim:tessera-spark_2.13` on Maven Central | `--packages io.github.gyuyeongkim:tessera-spark_2.13:1.4.4` |
 | PostgreSQL | [`tessera_pg`](https://pgxn.org/dist/tessera_pg/) on PGXN | `pgxn install tessera_pg` |
 | DuckDB | [`tessera`](https://duckdb.org/community_extensions/extensions/tessera.html) in the community extensions | `INSTALL tessera FROM community; LOAD tessera;` |
 

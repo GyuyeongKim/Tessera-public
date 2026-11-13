@@ -2,6 +2,7 @@ O ?= build
 CXX ?= g++
 OPT = -O3 -ffp-contract=off -fopenmp -fPIC -std=c++17 -Wall -Wno-unused-function $(EXTRA)
 OWN := $(shell $(CXX) -fno-weak -x c++ -c -o /dev/null /dev/null > /dev/null 2>&1 && echo -fno-weak)
+OWNCC := $(if $(OWN),sh $(CURDIR)/own_cc.sh)
 AMX_ARCH ?= -march=sapphirerapids
 BASE_ARCH = -march=x86-64-v3
 CORE = tessera.cpp tessera.hpp
@@ -47,18 +48,18 @@ install: $(O)/libtessera.a $(O)/$(SHLIB)
 	cp tessera_c.h $(PREFIX)/include/tessera/
 	sed -e 's|@PREFIX@|$(PREFIX)|' -e 's|@VERSION@|$(VERSION)|' -e 's|@LIBS_PRIVATE@|$(LIBS_PRIVATE)|' tessera.pc.in \
 	  > $(PREFIX)/lib/pkgconfig/tessera.pc
-$(O)/core_amx.o: tessera_amx.cpp $(CORE) | $(O)
-	$(CXX) $(OPT) $(AMX_ARCH) $(OWN) -c -o $@ $<
-$(O)/core_vnni.o: tessera_vnni.cpp $(CORE) | $(O)
-	$(CXX) $(OPT) -march=x86-64-v4 -mavx512vnni -mavx512vbmi -mgfni -mbmi2 $(OWN) -c -o $@ $<
-$(O)/core_avx512.o: tessera_avx512.cpp $(CORE) | $(O)
-	$(CXX) $(OPT) -march=x86-64-v4 $(OWN) -c -o $@ $<
+$(O)/core_amx.o: tessera_amx.cpp $(CORE) own_cc.sh | $(O)
+	$(OWNCC) $(CXX) $(OPT) $(AMX_ARCH) $(OWN) -c -o $@ $<
+$(O)/core_vnni.o: tessera_vnni.cpp $(CORE) own_cc.sh | $(O)
+	$(OWNCC) $(CXX) $(OPT) -march=x86-64-v4 -mavx512vnni -mavx512vbmi -mgfni -mbmi2 $(OWN) -c -o $@ $<
+$(O)/core_avx512.o: tessera_avx512.cpp $(CORE) own_cc.sh | $(O)
+	$(OWNCC) $(CXX) $(OPT) -march=x86-64-v4 $(OWN) -c -o $@ $<
 $(O)/core_avx2.o: tessera_avx2.cpp $(CORE) | $(O)
 	$(CXX) $(OPT) $(BASE_ARCH) -c -o $@ $<
 $(O)/core_portable.o: tessera_portable.cpp $(CORE) | $(O)
 	$(CXX) $(OPT) -c -o $@ $<
-$(O)/dispatch.o: dispatch.cpp tessera.hpp tessera_c.h | $(O)
-	$(CXX) $(OPT) $(OWN) -c -o $@ $<
+$(O)/dispatch.o: dispatch.cpp tessera.hpp tessera_c.h own_cc.sh | $(O)
+	$(OWNCC) $(CXX) $(OPT) $(OWN) -c -o $@ $<
 $(O)/common.o: common.cpp tessera.hpp | $(O)
 	$(CXX) $(OPT) $(BASE_ARCH) -c -o $@ $<
 $(O)/query.o: query.cpp query.hpp tessera.hpp | $(O)
